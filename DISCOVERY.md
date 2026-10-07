@@ -608,3 +608,28 @@ sample-seconds (TLS boundary), every ~5s. So:
 - If instead we ever demote short bursts cooker-side, that is a *relaxation* of
   false-idle risk and needs an explicit yes; the default keeps bytes the trigger
   and the asymmetry safety-first.
+
+## §18 Ledger audit — the two NULL-score publishes (2026-10-07, pre-gate relics)
+
+`cooker status` today reports `2 published`; `status --json` says `today.published: 2`.
+The rows are real and the counter is honest, but they were **not judged**:
+
+- `artifacts`: two PUBLISHED rows, `generator=research`, `score` NULL, `scores_json`
+  empty, created 02:08:15 and 02:09:27 (local) —
+  `why-does-a-long-prefill-block-other-requests-on…md` and
+  `what-does-a-home-nas-get-wrong-about-backups-and…md`, both present on disk in
+  `var/outputs/2026-10-07/`.
+- `git log -S 'if verdict == "PUBLISH"' -- src/cooker/chains.py` → **4818637 @ 08:13**,
+  the M5 evaluate-edge. Those chains completed at 02:08/02:09, five hours *before* the
+  gate that requires a `PUBLISH` verdict to spawn a publish stage existed. M4-era
+  `chains.advance` emitted `publish` unconditionally.
+- The digest agrees: `Threshold 3.5. 0 passed, 5 rejected, 8 unjudged` — the two
+  pre-gate rows are not, and cannot be, counted as passed.
+
+**Consequence.** §4's "nothing cleared 3.5 in production" remains true for *judged*
+work. The published files stand as honest output of an ungated prototype, not as
+quality endorsements; the live UI will show them as served plates. Do not delete them
+to make the story tidier — they are the physical proof that the gate arrived late,
+which is the kind of fact this project keeps by writing down. If a tidy ledger is
+wanted, annotate (add a `note`), don't erase. The current code cannot reproduce the
+path: an unscored draft cannot spawn a publish stage (unit-covered by the M5 gate tests).

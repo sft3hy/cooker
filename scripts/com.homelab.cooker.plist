@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Cooker, forever (M8). KeepAlive: the point of the service is that it
+     survives a closed terminal, a logout, and a reboot — the daemon's own
+     politeness gates are what stop it cooking, not supervision. LIVE because
+     dry-run in a daemon that is supposed to cook overnight is a museum piece.
+     Nice/Background: it is a guest; launchd should schedule it like one.
+     ThrottleInterval 10: if it dies at startup (port stolen by the stray
+     loopback http.server is the known shape), relaunch every 10s, not every
+     second, so `doctor` and the log stay readable. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.homelab.cooker</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/samueltownsend/dev/hobby/cooker/.venv/bin/cooker</string>
+    <string>serve</string>
+    <string>--live</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/samueltownsend/dev/hobby/cooker</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/samueltownsend</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/samueltownsend/Library/Logs/cooker.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/samueltownsend/Library/Logs/cooker.log</string>
+
+  <key>Nice</key>
+  <integer>5</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

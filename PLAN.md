@@ -188,7 +188,7 @@ Each milestone is independently useful and shippable. One at a time.
 | M5 gate, dedup, feedback, digest | **done** | `bench10_digest_live.py` Test 3 PASS — 8 stages live, evaluated, digest rendered with the rows' own numbers |
 | M6 CLI surface | **done** | `status add pause resume list show rate digest doctor` all live against a scratch DB; 19 tests in `tests/test_cli.py`; the ids `list` prints are asserted to resolve in `rate`/`show` |
 | M7 kitchen UI | **done (live proof pending)** | node 26 installed; `server.py` (FastAPI on loopback:8256) + `web/` Svelte canvas kitchen built; 10 tests in `tests/test_server.py`, 228 total; `cooker serve` mounts kitchen+API+static, SSE replays by rowid, gate panel honest `stale` when detached |
-| M8 launchd + Traefik + register | not started | see §11 ceremony |
+| M8 launchd + Traefik + register | **done** | plist `scripts/com.homelab.cooker.plist` installed + running (`serve --live`, KeepAlive); Pi-hole A record live; Traefik router→`host.docker.internal:8256` issued with homeca cert; `HOMELAB-SERVICE-MAP.md` rows + changelog appended; `doctor` launchd warn→pass. First issue hit the ACME-before-DNS ordering trap (§17/HANDOVER §5.3) — `docker restart traefik` fixed |
 | M9 remaining generators | not started | `chains.advance` emits `chain.stub` for them today; one orphan `brainstorm/generate` stage sits QUEUED as proof |
 | M10 IMPLEMENTATION.md | not started | — |
 

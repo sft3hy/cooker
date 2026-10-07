@@ -4,6 +4,7 @@
 daemon:
   bind_host: 127.0.0.1          # tailnet reaches it through Traefik, never bind 0.0.0.0
   port: 8256                    # registered in ~/HOMELAB-SERVICE-MAP.md
+  launchd_label: com.homelab.cooker   # M8; doctor checks ~/Library/LaunchAgents/<label>.plist
   data_dir: var               # relative to repo root unless absolute
   log_level: INFO
 
