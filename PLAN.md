@@ -177,6 +177,34 @@ Each milestone is independently useful and shippable. One at a time.
 
 **Runtime ordering:** M1–M3 dry-run → M3 real-but-tiny → M4+ real. Nothing touches omlx before the cancellation path is proven on a 200-token request.
 
+### Status (as of 2026-10-07)
+
+| milestone | state | evidence |
+|---|---|---|
+| M1 storage, queue, doctor | **done** | `cooker db selftest`, 27 tests at the time |
+| M2 detection by bytes | **done** | `cooker watch`; §11 — 0 vs 5,376 B/s separation |
+| M3 cancellable inference, safety gate | **done** | `bench8_cancellation_live.py` — 1,711 B/s busy → inflight 0 → baseline |
+| M4 research DAG | **done** | `bench9_research_chain_live.py` Test 1 PASS, 7/7 stages |
+| M5 gate, dedup, feedback, digest | **done** | `bench10_digest_live.py` Test 3 PASS — 8 stages live, evaluated, digest rendered with the rows' own numbers |
+| M6 CLI surface | partial | `rate digest feedback park unpark` landed with M5; `list show` still M6 |
+| M7 kitchen UI | not started | **no node/npm on this shell's PATH** — install first |
+| M8 launchd + Traefik + register | not started | see §11 ceremony |
+| M9 remaining generators | not started | `chains.advance` emits `chain.stub` for them today; one orphan `brainstorm/generate` stage sits QUEUED as proof |
+| M10 IMPLEMENTATION.md | not started | — |
+
+**Nothing is pushed.** `master` is local.
+
+Carried forward, unresolved and named so:
+
+- **A live SSE client keeps Cooker off the GPU indefinitely.** The detector reads
+  `opencode`'s steady ~1.7 KB/s decode as `ACTIVE_INFER`, so `run --live` claimed
+  nothing for 151 s (§14). Correct behaviour, unusable outcome. M8 needs a burst
+  detector — Δ bytes over a short window — not a lower `infer_min_bps`.
+- **No artifact has cleared 3.5 live yet.** Every verdict so far is a REJECT, so
+  the "Worth reading" section has unit coverage and no production example.
+- **`bench6_abort_prefill.py` still wants a genuinely idle window**, and the
+  prefill ceiling goes up only on a clean win from it.
+
 ## 11. Ports & homelab registration (obligatory ceremony)
 - Cooker binds **`127.0.0.1:8256`** — free, unregistered, loopback-only (matches how `opencode` stays off the LAN).
 - Add `cooker.home.arpa` to `HOSTS` in `~/homelab/edge/scripts/02-pihole-wildcard.sh`, re-run (idempotent).
