@@ -917,3 +917,24 @@ closed honest: CANDIDATE kept on the shelf, never served. **The first
 deep-dive through opencode's hands bought attention at the judge, not a
 pass — exactly what the amendment promised, now measured rather than
 asserted. The bar stays at 3.5.**
+
+
+### The lengthy-order incident: the judge was right, the plumbing was wrong
+
+The first 888-character order produced a 7.4 KB brief and a **1.0 REJECT —
+"truncated fragment of the prompt itself"** — and the judge's reading was
+*correct*: the evaluator scores a front slice bounded by the prefill ceiling
+(~1,100 chars at 1,000 tokens), the delegate doc opened with the full order
+verbatim as its H1 (86% of the window), and the same order rode the eval
+prompt's header, shrinking the budget before the draft was even read. The
+judge was handed prompt + prompt + 200 chars of brief cut mid-sentence.
+
+Fix in the honest direction — the window belongs to the brief: readable
+`short_title` heading, the full order preserved verbatim in the footer, the
+evaluator's topic channel trimmed to 120 readable chars (the full text stays
+in payload and on disk for the audit). Measured window: **1,101 → 1,875
+chars, every one of them brief.** The open owner question — a deep-dive
+prefill allowance (proposed 4,200 tokens ≈ the whole 7 KB brief judged, +1s
+prefill only when busy, gate still drops mid-stage) — stays unraised until
+answered; the bar itself has not moved all day and will not move without
+you.
