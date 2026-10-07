@@ -891,10 +891,14 @@ parallel."` — conversation, not brief. Collection now sorts by timestamp and
 is correct against either order; the fake serves newest-first like the
 device, and the regression test asserts the newest turn wins. The poisoned
 candidate was cancelled out of the chain's record with the reason in its
-`error` column; a fresh order re-cooked the same topic. And the judge
-settled it independently: the poisoned plate had already reached evaluation
-and scored **2.8 REJECT — "the output is truncated mid-sentence, rendering
-the actionable advice incomplete"**. The judge never saw the bug report; it
-read the plate and refused to serve it. That is the argument for why the
-judge sits at the end of every chain no matter whose hands cooked — when
-the kitchen itself is wrong, the last gate is still honest.
+`error` column — early enough that evaluation never ran, so the bug cost
+zero GPU-seconds of judging. A fresh order re-cooked the same topic.
+
+The correction is part of the record: an earlier draft of this section
+claimed the judge had independently scored the poisoned plate 2.8 REJECT.
+The ledger says otherwise — that 2.8 was a different chain's evaluation
+from 12:50, an hour before the order existed, and this chain's critique was
+cancelled before it ever reached the judge. The story was lovely and the
+ledger could not confirm it, so the ledger wins, here in ink. (See §0:
+never report what the disk cannot confirm — the rule applies to its own
+author last of all.)
