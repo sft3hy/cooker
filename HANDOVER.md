@@ -310,6 +310,9 @@ other. `bench11` is read-only; `bench12` asserts its own decision threshold (+75
     -d '{"topic":"why do dotfiles deserve their own manager","kind":"deep-dive"}'`.
    `deep-dive` delegates to opencode and faces the same judge; `research` is the
    five-stage way. Pending orders cap at 429 (with the count), pause answers 409.
+   **Topics run as long as you like** — owner's amendment, same day: the 200-char
+   guess is dead, the ceiling is `orders.max_topic_chars` (20,000), the floor is
+   8, and the full text rides the payload and the delegate brief untruncated.
    To stop a running delegation: pause (`POST /api/pause`) or `kickstart -k` the
    daemon — a cancelled delegate interrupts its opencode session before it lets go.
    The remaining stub generators (`audit` et al) still wait for their edges;
