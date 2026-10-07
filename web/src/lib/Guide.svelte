@@ -60,6 +60,25 @@
 </section>
 
 <section class="room">
+  <h2>ordering your own dish</h2>
+  <p>Write at the counter on the KITCHEN tab: a topic, and one of two
+    kinds.</p>
+  <ul>
+    <li><b>DEEP-DIVE</b> — the kitchen hands your topic to
+      <b>OpenCode</b> — the same assistant you drive in the terminal — as
+      its own <em>new, separate</em> session, in its own tidy folder on
+      this machine. It digs (a few minutes of real GPU), writes a brief,
+      and the brief faces the same harsh judge as everything else. You can
+      see that session in OpenCode's own session list; the kitchen never
+      hides it, and never touches <em>your</em> sessions.</li>
+    <li><b>RESEARCH</b> — the five-stage way above, cooked at home.</li>
+  </ul>
+  <p>The counter takes three pending orders at a time and says so politely
+    when it won't take a fourth. While the kitchen is paused it won't take
+    tickets at all — an order never unlocks a closed kitchen.</p>
+</section>
+
+<section class="room">
   <h2>reading the signs</h2>
   <ul>
     <li><span class="k open">OPEN / ready</span> — GPU quiet, pots filling.</li>
@@ -78,9 +97,11 @@
     <li><b>STATS</b> (key 3) — the books: tokens spent, GPU time, who cooked what.</li>
     <li><b>GUIDE</b> (key 4) — you are here.</li>
   </ul>
-  <p class="fine">Everything runs on this machine. The kitchen makes no calls
-    to the internet — the only "search" it performs is a local helper if one
-    is configured, and the only network it ever uses is to ask your own GPU.</p>
+  <p class="fine">Everything runs on this machine. The kitchen's own calls
+    are to your GPU and, for deep-dives, to your own local OpenCode server
+    — which digs with whatever tools <em>you</em> configured for it (a web
+    search if you gave it one). No third-party services, no cloud, no
+    telemetry. The only GPU either one ever asks is yours.</p>
 </section>
 
 <style>
