@@ -24,12 +24,22 @@ So bytes are the signal. A peer that moves nothing is not cooking, and the
 kitchen has to be allowed to light anyway — otherwise a permanently-open
 keepalive means a permanently cold kitchen, which is a daemon with no purpose.
 
-The asymmetry we accept
-----------------------
-nettop attributes bytes per *process* and offers no address column to filter on,
-so a peer connected to :8000 that is also fetching a webpage reads as busy. That
-is wrong in the safe direction: a false busy costs us cooking time, a false idle
-costs Sam his interactive latency.
+What a process byte is *not* (the 2026-10-07 fix)
+---------------------------------------------------
+`nettop -P` rolls up every byte a process moved, on every interface, to every
+destination. Measured live (`DISCOVERY.md` §19): omlx downloading model weights
+from Hugging Face's CDN moved ~70 MB/s *in* over `en1` to AWS `:443` while its
+inference port served nothing — the rollup read "omlx serving 23,186,419 B/s"
+and the gate correctly refused to cook into a firehose that was not inference.
+A byte is only proof of *service* if it crossed the inference endpoint. So the
+probe runs per-flow (`nettop` without `-P`) and counts only flows whose local or
+remote endpoint is a configured server port (`:8000` on this box — every honest
+inference path, direct tailnet, OrbStack hairpin or LAN, has that port on one
+side; a CDN download has it on neither). Rollup rows are read only for process
+grouping, never for bytes. Two further rules keep ghosts out: the first block
+after the probe starts has no baseline, so it contributes **zero** rather than
+the lifetime counter divided by a short window; and totals are saturated —
+connections closing or processes restarting fall to zero, never to a firework.
 
 Dependency direction is deliberate: nothing here imports Cooker's types. The
 probe reports `{pid: bytes}` and `detect` decides what a pid means, so `detect`
@@ -50,6 +60,24 @@ from dataclasses import dataclass
 from typing import Any
 
 SAMPLE_SECONDS = 1.0  # the `-s 1` inside each poll; the run costs ~1.25s
+
+
+def flow_port(endpoint: str) -> int | None:
+    """Port from a nettop flow endpoint, IPv4 `a.b.c.d:8000` and IPv6 in both
+    nettop's dot form `[2603:…].443` / `2603:….443` and bracket form `::1:8000`.
+
+    Order matters: colon first (IPv4/bracket), dot second (nettop's IPv6 form,
+    because every colon-bearing IPv6 would otherwise misparse), and a tail that
+    is not all digits is no port at all — `?:?` on a half-open flow returns
+    None, which never matches a filter, which is the honest answer."""
+    tail = endpoint.rpartition(":")[2]
+    if tail.isdigit():
+        return int(tail)
+    tail = endpoint.rpartition(".")[2]
+    if tail.isdigit():
+        return int(tail)
+    return None
+
 
 
 @dataclass(frozen=True)
@@ -128,6 +156,7 @@ class WireProbe:
         clock: Callable[[], float] = time.time,
         interval_s: float | None = None,
         window_s: float | None = None,
+        infer_ports: tuple[int, ...] | None = None,
     ) -> None:
         self.clock = clock
         get = getattr(cfg, "get", lambda _k, d=None: d)
@@ -137,6 +166,10 @@ class WireProbe:
                             else get("detect.wire_window_seconds", 3.0))
         self.window = max(self.window, self.interval * 2)
         self.capacity = max(2, round(self.window / self.interval))
+        # None means "count every flow" — a generic throughput probe. `detect`
+        # passes the inference ports so that bytes are only ever counted across
+        # the endpoints that mean service (see module docstring, §19).
+        self.infer_ports = frozenset(infer_ports) if infer_ports else None
         # Poll period. The run itself costs ~1.25s of the cycle, so this is the
         # floor on how quickly a new generation is noticed.
         self.cycle = self.interval
@@ -144,7 +177,9 @@ class WireProbe:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._cols: dict[str, int] = {}
-        self._prev: dict[int, tuple[int, int]] = {}
+        self._prev: dict[int, int] = {}
+        self._cur_pid: int | None = None
+        self._block: dict[int, int] = {}
         self._ring: deque[dict[int, int]] = deque(maxlen=self.capacity)
         self._pending: dict[int, int] = {}
         self._snap = DEAD
@@ -200,12 +235,14 @@ class WireProbe:
         Each run prints two cumulative samples one second apart, so the run
         answers on its own: the diff between its two samples is the bytes moved
         in that second. Nothing has to survive between cycles except the ring.
+        Per-flow mode (no `-P`): the rollup cannot tell a model download from a
+        served token, and that distinction is the whole job (§19).
         """
         while not self._stop.is_set():
             t0 = self.clock()
             try:
                 proc = subprocess.Popen(
-                    ["nettop", "-n", "-x", "-P", "-L", "2", "-s",
+                    ["nettop", "-n", "-x", "-L", "2", "-s",
                      f"{SAMPLE_SECONDS:g}"],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                 )
@@ -241,12 +278,17 @@ class WireProbe:
             self._stop.wait(max(0.1, self.cycle - (self.clock() - t0)))
 
     def _ingest(self, text: str) -> None:
-        """Turn nettop's CSV into per-pid byte deltas, sealing at each header.
+        """Turn nettop's per-flow CSV into per-pid byte totals, sealing at each
+        header.
 
-        Column positions come from the header above every sample, never from a
-        hard-coded index: `-J` is silently ignored on this build, and assuming an
-        index once had me reading retransmit counts as throughput, which looked
-        exactly like traffic that was not there.
+        Two row kinds: `omlx-server.22630` is a process rollup — read only for
+        grouping, its bytes are the lie this module exists to stop (§19) — and
+        `tcp4 100.122.197.81:8000<->…` is a flow, whose lifetime totals count
+        only when an endpoint is one of `infer_ports`. Column positions come from
+        the header above every sample, never from a hard-coded index: `-J` is
+        silently ignored on this build, and assuming an index once had me reading
+        retransmit counts as throughput, which looked exactly like traffic that
+        was not there.
         """
         for line in text.splitlines():
             if self._stop.is_set():
@@ -262,6 +304,7 @@ class WireProbe:
                 # almost everything it saw.
                 self._seal()
                 self._cols = {name: i for i, name in enumerate(cells) if name}
+                self._cur_pid = None  # a fresh group list follows this header
                 continue
             cols = self._cols
             if "bytes_in" not in cols or "bytes_out" not in cols:
@@ -269,23 +312,35 @@ class WireProbe:
             need = max(cols["bytes_in"], cols["bytes_out"])
             if len(cells) <= need:
                 continue
-            pid_s = cells[1].rpartition(".")[2]
-            if not pid_s.isdigit():
-                continue
-            pid = int(pid_s)
-            try:
-                b_in, b_out = int(cells[cols["bytes_in"]]), int(cells[cols["bytes_out"]])
-            except ValueError:
-                continue
-            with self._lock:
-                prev = self._prev.get(pid)
-                if prev is not None:
-                    # Saturating: a counter that fell means the process restarted,
-                    # and zero is the honest answer where a negative is a lie and a
-                    # wraparound is a firework.
-                    self._pending[pid] = self._pending.get(pid, 0) + (
-                        max(0, b_in - prev[0]) + max(0, b_out - prev[1]))
-                self._prev[pid] = (b_in, b_out)
+            label = cells[1].strip()
+            if "<->" in label:
+                # A flow row: `tcp4 100.122.197.81:8000<->peer:port`. Matched on
+                # the arrow, not on a space, because process names carry spaces
+                # (`OrbStack Helper.18634`) and a rollup must not be mistaken for
+                # a flow it never was.
+                if self._cur_pid is None:
+                    continue
+                _, _, spec = label.partition(" ")
+                left, _, right = spec.partition("<->")
+                if self.infer_ports is not None and (
+                        flow_port(left) not in self.infer_ports
+                        and flow_port(right) not in self.infer_ports):
+                    continue
+                try:
+                    moved = int(cells[cols["bytes_in"]]) + int(cells[cols["bytes_out"]])
+                except ValueError:
+                    continue
+                self._block[self._cur_pid] = self._block.get(self._cur_pid, 0) + moved
+            else:
+                tail = label.rpartition(".")[2]
+                self._cur_pid = int(tail) if tail.isdigit() else None
+                if self._cur_pid is not None:
+                    # Seen, with nothing across the endpoint: a zero observation,
+                    # which is *quiet* — not the absence of an observation, which
+                    # would be *blind*. The distinction is this module's reason
+                    # for existing, and a download-only process must not flicker
+                    # the kitchen between quiet and deaf.
+                    self._block.setdefault(self._cur_pid, 0)
 
     def _seal(self) -> None:
         """Close one sample into the ring and rebuild the window.
@@ -294,8 +349,21 @@ class WireProbe:
         it would make the window one second long no matter what the config said,
         which is the kind of bug that shows up as 'the detector is twitchy' three
         weeks from now and never as a stack trace.
+
+        Deltas are per-pid differences of the filtered flow totals between
+        blocks. A pid seen for the first time contributes **zero**: without a
+        baseline the only honest number is zero, and dividing a lifetime counter
+        by a one-second window is how a warm idle box read as 23 MB/s (§19).
+        A total that falls — a connection closed, a process restarted — is
+        saturated to zero: a negative is a lie and a wraparound a firework.
         """
         with self._lock:
+            for pid, total in self._block.items():
+                prev = self._prev.get(pid)
+                self._prev[pid] = total
+                delta = 0 if prev is None else max(0, total - prev)
+                self._pending[pid] = self._pending.get(pid, 0) + delta
+            self._block = {}
             if not self._pending:
                 return
             self._ring.append(self._pending)

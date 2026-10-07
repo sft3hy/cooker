@@ -35,11 +35,20 @@ class Clock:
 
 HEADER = "time,,interface,state,bytes_in,bytes_out,rx_dupe,rx_ooo,re-tx,rtt_avg\n"
 
+SPEC = "tcp4 127.0.0.1:8000<->127.0.0.1:52000"  # a plain local inference call
 
-def sample(stamp: str, rows: list[tuple[str, int, int]]) -> bytes:
-    """One nettop sample: header, then one row per process."""
+
+def sample(stamp: str, rows: list[tuple[str, str, int, int]]) -> bytes:
+    """One nettop sample: header, then per process a rollup row and a flow row.
+
+    The rollup's bytes are deliberately 0 in fixtures: the probe must never read
+    them (§19), and tests that fed bytes through the rollup would be testing the
+    lie rather than the fix.
+    """
     out = [HEADER]
-    out += [f"{stamp},{name},,,{b_in},{b_out},0,0,0,0\n" for name, b_in, b_out in rows]
+    out += [f"{stamp},{name},,,0,0,0,0,0,0\n" for name, _spec, _, _ in rows]
+    out += [f"{stamp},{spec},lo0,Established,{b_in},{b_out},0,0,0,0\n"
+            for _name, spec, b_in, b_out in rows]
     return "".join(out).encode()
 
 
@@ -63,9 +72,11 @@ def feed(probe: WireProbe, blobs: list[bytes]) -> None:
     probe._ingest("".join(b.decode() for b in blobs) + HEADER)
 
 
-def probe(interval: float = 1.0, window: float = 3.0) -> tuple[WireProbe, Clock]:
+def probe(interval: float = 1.0, window: float = 3.0,
+          infer_ports: tuple[int, ...] | None = None) -> tuple[WireProbe, Clock]:
     clk = Clock()
-    return WireProbe(interval_s=interval, window_s=window, clock=clk), clk
+    return WireProbe(interval_s=interval, window_s=window, clock=clk,
+                     infer_ports=infer_ports), clk
 
 
 # --- the arithmetic the detector thresholds on -------------------------
@@ -107,12 +118,14 @@ def test_a_sample_seals_once_at_the_header() -> None:
     """
     p, _clk = probe(window=3.0)
     feed(p, [
-        sample("01:00:01.000000", [("omlx-server.22630", 100, 50)]),
-        sample("01:00:02.000000", [("omlx-server.22630", 150, 90)]),
-        sample("01:00:03.000000", [("omlx-server.22630", 400, 3000)]),
+        sample("01:00:01.000000", [("omlx-server.22630", SPEC, 100, 50)]),
+        sample("01:00:02.000000", [("omlx-server.22630", SPEC, 150, 90)]),
+        sample("01:00:03.000000", [("omlx-server.22630", SPEC, 400, 3000)]),
     ])
     w = p.snapshot()
-    assert w.samples == 2, "three samples, the first has no baseline to diff"
+    assert w.samples == 3, ("all three blocks are *observed*; the first merely has "
+                            "no baseline, so it contributes zero — seen-and-zero is "
+                            "quiet, not blind")
     assert w.moved[22630] == (150 - 100) + (90 - 50) + (400 - 150) + (3000 - 90)
     assert w.server_talking((22630,), 256.0)
 
@@ -126,8 +139,8 @@ def test_a_quiet_wire_reports_zero_and_stays_up() -> None:
     """
     p, _clk = probe()
     feed(p, [
-        sample("01:00:01.000000", [("OrbStack Helper.18634", 500, 900)]),
-        sample("01:00:02.000000", [("OrbStack Helper.18634", 500, 900)]),
+        sample("01:00:01.000000", [("OrbStack Helper.18634", SPEC, 500, 900)]),
+        sample("01:00:02.000000", [("OrbStack Helper.18634", SPEC, 500, 900)]),
     ])
     w = p.snapshot()
     assert w.up, "a quiet wire is not a broken one"
@@ -140,8 +153,8 @@ def test_counter_reset_reads_as_zero_not_as_traffic() -> None:
     that into an enormous number that looks exactly like a busy machine."""
     p, _clk = probe()
     feed(p, [
-        sample("01:00:01.000000", [("omlx-server.22630", 9_000_000, 8_000_000)]),
-        sample("01:00:02.000000", [("omlx-server.22630", 100, 50)]),
+        sample("01:00:01.000000", [("omlx-server.22630", SPEC, 9_000_000, 8_000_000)]),
+        sample("01:00:02.000000", [("omlx-server.22630", SPEC, 100, 50)]),
     ])
     assert p.snapshot().moved[22630] == 0
 
@@ -151,8 +164,8 @@ def test_stale_output_reports_blind_rather_than_idle() -> None:
     longer *now*, and 'start working' cannot rest on them."""
     p, clk = probe(interval=1.0, window=2.0)
     feed(p, [
-        sample("01:00:01.000000", [("omlx-server.22630", 100, 50)]),
-        sample("01:00:02.000000", [("omlx-server.22630", 900, 4000)]),
+        sample("01:00:01.000000", [("omlx-server.22630", SPEC, 100, 50)]),
+        sample("01:00:02.000000", [("omlx-server.22630", SPEC, 900, 4000)]),
     ])
     assert p.snapshot().up
     clk.advance(p.stale_after + 1)
@@ -166,7 +179,7 @@ def test_the_ring_holds_the_configured_window() -> None:
     per second is calibrated against a span that does not exist."""
     p, _clk = probe(interval=1.0, window=4.0)
     assert p.capacity == 4
-    blobs = [sample(f"01:00:0{i}.000000", [("omlx-server.22630", i * 10, i * 5)])
+    blobs = [sample(f"01:00:0{i}.000000", [("omlx-server.22630", SPEC, i * 10, i * 5)])
              for i in range(1, 8)]
     feed(p, blobs)
     assert p.snapshot().window_s == 4.0
@@ -177,3 +190,71 @@ def test_a_window_shorter_than_the_interval_is_refused_not_broken() -> None:
     """Interval 1s and window 0.5s would mean a window with no samples in it."""
     p, _clk = probe(interval=1.0, window=0.5)
     assert p.window >= 2.0
+
+
+# --- the endpoint filter (the 2026-10-07 model-download fix, §19) --------
+
+
+DL4 = "tcp4 192.168.1.20:64098<->52.35.108.102:443"
+DL6 = "tcp6 2603:8000:8f01:42a9:40a:7596:e527:f2a3.49302<->2600:9000:24ba:600:17:b174:6d00:93a1.443"
+V6INFER = "tcp6 [2603:8000:d00::abcd].8000<->2001:db8::beef.51000"
+
+
+def test_a_model_download_is_not_someone_generating() -> None:
+    """The exact lie of 2026-10-07: omlx pulling 8.2 GB of weights from AWS
+    over `en1` while :8000 served nothing, and the process rollup read 'omlx
+    serving 23,186,419 B/s'. A byte is proof of service only if it crossed the
+    inference endpoint."""
+    p, _clk = probe(infer_ports=(8000,))
+    feed(p, [
+        sample("01:00:01.000000", [("Python.22630", DL4, 70_000_000, 100)]),
+        sample("01:00:02.000000", [("Python.22630", DL4, 140_000_000, 200)]),
+    ])
+    w = p.snapshot()
+    assert w.up, "a downloading box is watched and quiet, not deaf"
+    assert w.moved[22630] == 0
+    assert not w.server_talking((22630,), 256.0)
+
+
+def test_ipv6_dot_form_endpoints_parse_and_the_prefix_cannot_fool_them() -> None:
+    """nettop writes IPv6 ports with a dot (`addr.443`), and the live grep for
+    ':8000' that day matched an AWS CDN *address prefix* `2603:8000:…` — so
+    ports are parsed from the tail, never substring-matched."""
+    p, _clk = probe(infer_ports=(8000,))
+    feed(p, [
+        sample("01:00:01.000000", [("Python.22630", V6INFER, 1000, 500)]),
+        sample("01:00:02.000000", [("Python.22630", V6INFER, 2000, 1500)]),
+        sample("01:00:03.000000", [("Python.22630", DL6, 9_000_000, 100)]),
+    ])
+    w = p.snapshot()
+    assert w.moved[22630] == (2000 - 1000) + (1500 - 500), "the :8000 flow counts"
+    assert w.moved[22630] < 3000, "the 2603:8000:… download does not, prefix and all"
+
+
+def test_the_first_block_contributes_zero_not_the_lifetime_counter() -> None:
+    """Without a baseline the only honest number is zero. Dividing a lifetime
+    counter by a one-second window is how warm-and-idle reads as 23 MB/s."""
+    p, _clk = probe(infer_ports=(8000,))
+    feed(p, [
+        sample("01:00:01.000000", [("omlx-server.22630", SPEC, 9_000_000, 8_000_000)]),
+        sample("01:00:02.000000", [("omlx-server.22630", SPEC, 9_005_000, 8_000_000)]),
+        sample("01:00:03.000000", [("omlx-server.22630", SPEC, 9_005_000, 8_000_000)]),
+    ])
+    assert p.snapshot().moved[22630] == 5_000, "block two's growth, never block one's lifetime"
+
+
+def test_a_rollup_seen_elsewhere_is_quiet_not_blind() -> None:
+    """A process the probe can see, with nothing across the endpoint, is an
+    observation of zero. Dropping it entirely would flicker the kitchen between
+    quiet and deaf for every browser on the box."""
+    p, _clk = probe(infer_ports=(8000,))
+    feed(p, [
+        sample("01:00:01.000000", [
+            ("Python.22630", DL4, 50_000_000, 50),
+            ("Safari.999", "tcp4 192.168.1.20:52001<->142.250.0.1:443", 700_000, 9_000),
+        ]),
+        sample("01:00:02.000000", [("Python.22630", SPEC, 1_500, 700)]),
+    ])
+    w = p.snapshot()
+    assert w.moved[22630] == 2_200, ":8000 flow bytes, rollup lie excluded"
+    assert w.moved[999] == 0, "Safari is seen and served nothing on the port"

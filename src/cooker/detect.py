@@ -313,10 +313,14 @@ class LiveSampler:
         # Resident, not per-tick: nettop counts cumulatively, so a fresh process
         # each second has no earlier sample to diff and would answer "0 bytes"
         # forever. One long-lived reader, and `sample` just reads its dict.
+        # infer_ports: bytes count only across the inference endpoint, so a
+        # 70 MB/s model download over WAN cannot read as someone generating
+        # (§19 — the rollup that day said 23 MB/s while the port served nothing).
         self.wire = WireProbe(
             interval_s=float(cfg.get("detect.wire_interval_seconds", 1.0)),
             window_s=float(cfg.get("detect.wire_window_seconds", 3.0)),
             clock=clock,
+            infer_ports=(self.port,),
         )
         cad = cfg.get("detect.cadence_seconds", {}) or {}
         tick = float(cfg.get("detect.interval_seconds", 1.0))

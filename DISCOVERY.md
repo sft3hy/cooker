@@ -633,3 +633,42 @@ to make the story tidier — they are the physical proof that the gate arrived l
 which is the kind of fact this project keeps by writing down. If a tidy ledger is
 wanted, annotate (add a `note`), don't erase. The current code cannot reproduce the
 path: an unscored draft cannot spawn a publish stage (unit-covered by the M5 gate tests).
+
+## §19 The rollup lie — a model download is not someone generating (2026-10-07)
+
+Sam: *"it says paused, someone is generating, but omlx just has the model warm in
+memory, it is not actually in use."* He was right, and the number in the log explains
+it: `ACTIVE_INFER omlx serving 23,186,419 B/s`.
+
+Measured live against the same kernel counters nettop reads:
+
+- omlx (pid 22630) was pulling **~70 MB/s over `en1` from AWS us-west-2 `:443`**
+  (multiple parallel CDN flows, `rx_ooo` enormous) — weights, ~8.2 GB lifetime
+  `bytes_in`, straight into RAM. That is the "model warm in memory."
+- Meanwhile the inference port was a whisper: the honest tailnet flow showed
+  **1,618 B in / 13,052 B out**. Nobody was being served at 23 MB/s; something was
+  being *downloaded* at 70.
+- `nettop -P` (what the probe ran) rolls up every byte a process moved, on every
+  interface, to every peer. The rollup cannot tell a download from a service, and
+  `Wire._ingest` summed in+out of that rollup. Correct arithmetic, wrong question.
+
+**Fix:** the probe runs per-flow (`nettop -n -x -L 2 -s 1`, no `-P`) and counts a
+flow only when a **parsed endpoint port** is in `detect.omlx_port` — every honest
+inference path (opencode direct over utun9, dashboard via OrbStack hairpin, LAN)
+carries `:8000` on one side; a CDN download carries it on neither. Rollup rows are
+read for process grouping only, never bytes; a rollup-only process seals as a
+**zero observation** (quiet, not blind). Two ghosts died with it: the first block
+contributes zero (no baseline ⇒ no lifetime-counter-divided-by-window fireworks),
+and totals saturate at zero on falls (closed connections, restarts). Two parsing
+traps verified live: nettop writes IPv6 ports with a **dot** (`addr.443`), and the
+CDN's own address prefix `2603:8000:…` substring-matches `:8000` — ports are parsed
+from the tail (`flow_port`), never substring-matched. Process names carry spaces
+(`OrbStack Helper.18634`), so flow rows are recognised by `<->`, not by a space.
+
+**After the fix, live, same download running:** the absurd 23 MB/s is gone; what
+remains is honest — `7,748 B/s` attributed to a flow caught mid-request uploading
+**284 KB/s to `:8000`**: opencode resending this very session's context. That is a
+real client of the GPU (agents count as someone, commandment 1), so the kitchen
+stands down correctly. The dashboard metronome (~1,720 B/s, §17) remains the
+structural blocker; nothing was relaxed to get the honest reading: floor 256,
+`claim_quiet: 4.0`, threshold 3.5 all untouched.
