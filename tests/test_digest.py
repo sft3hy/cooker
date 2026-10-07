@@ -307,3 +307,36 @@ def test_yesterday_is_not_today(tmp_path: Path) -> None:
         date.today().toordinal() - 1))
     assert yesterday == [], "yesterday's digest contains today's work"
     conn.close()
+
+
+def test_topics_md_prose_is_not_a_research_topic(tmp_path: Path) -> None:
+    """The file is allowed to explain itself, and the parser must know the
+    difference. The live topics.md carried six lines of help text ahead of the
+    real backlog, and the first thing the daemon would ever research was
+    "`#` lines are comments"."""
+    (tmp_path / "topics.md").write_text(
+        "# Topics\n"
+        "\n"
+        "One topic per line (`-` bullets and bare lines both work).\n"
+        "Delete a line to withdraw a topic; add one to queue it.\n"
+        "\n"
+        "## Backlog\n"
+        "\n"
+        "- why does a long prefill block other requests\n"
+        "- traefik middlewares worth running\n",
+        encoding="utf-8")
+    c = cfg(tmp_path, topics={"file": str(tmp_path / "topics.md")})
+    ts = chains.read_topics(c)
+    assert ts == ["why does a long prefill block other requests",
+                  "traefik middlewares worth running"], ts
+    assert not any("`" in t or "topic per line" in t for t in ts), ts
+
+
+def test_a_bare_lines_topics_file_still_works(tmp_path: Path) -> None:
+    """No bullets at all means bare lines are the topics: the plainest possible
+    file must still be readable, or the fix has just moved the bug."""
+    (tmp_path / "topics.md").write_text(
+        "why does a long prefill block other requests\n"
+        "what a NAS gets wrong about backups\n", encoding="utf-8")
+    c = cfg(tmp_path, topics={"file": str(tmp_path / "topics.md")})
+    assert len(chains.read_topics(c)) == 2

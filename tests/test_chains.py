@@ -852,3 +852,33 @@ async def test_live_seed_then_the_queue_drains(tmp_path: Path) -> None:
     assert published, "nothing published"
     assert safety.scan_secrets(published[0].read_text()).clean
     conn.close()
+
+
+def test_wrapped_prose_above_the_list_is_not_queue(tmp_path: Path) -> None:
+    """The bug, in the shape that defeated the obvious fix.
+
+    The live topics.md explains itself in wrapped paragraphs, so a prose line can
+    end mid-sentence with no full stop — "does it end with a period" cannot tell
+    documentation from a subject. What does separate them is position: the list is
+    the queue, and anything above the first marker is documentation. A bare line
+    below the list is still a topic, which is the promise the existing parse test
+    makes and which this must not break.
+    """
+    c = cfg(tmp_path)
+    Path(c.get("topics.file")).write_text(
+        "# Topics\n"
+        "\n"
+        "Cooker takes the first line whose subject has not been researched in the\n"
+        "last fourteen days, builds a chain for it, and marks it seen so it does\n"
+        "not repeat itself.\n"
+        "\n"
+        "## Backlog\n"
+        "\n"
+        "- why does a long prefill block other requests\n"
+        "- traefik middlewares worth running\n"
+        "a bare topic trailing the list\n",
+        encoding="utf-8")
+    got = chains.read_topics(c)
+    assert got == ["why does a long prefill block other requests",
+                   "traefik middlewares worth running",
+                   "a bare topic trailing the list"], got

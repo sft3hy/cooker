@@ -160,19 +160,52 @@ def read_topics(cfg: Config) -> list[str]:
     topic by editing it, and remove one to take it back. It is the reason
     `topics.md` lives in the repo root rather than in the database, because a
     queue you cannot `cat` is a queue you cannot reason about at 11pm.
+
+    That same readability is the hazard. A file you are allowed to annotate in
+    prose means the *documentation* is in the file too, and a parser that accepts
+    every non-comment line will happily queue "`#` lines are comments" as a
+    research subject — which the live topics.md did, six lines of help text ahead
+    of the real backlog, each one a research budget away from being generated.
+
+    Three rules, in order of trust:
+
+    * a bulleted or numbered line is a topic, always;
+    * in a file that contains no markers at all, bare lines are topics too,
+      because the plainest possible topics file is a list of bare lines and
+      refusing to read it would move the bug rather than fix it;
+    * in a file that does have markers, a bare line joins the queue only once the
+      list has started, and never if it reads as a sentence.
+
+    The middle case is the one that keeps the promise the file's own help text
+    makes; the third is what stops wrapped prose — where a line ends mid-sentence,
+    so "does it end with a full stop" cannot tell documentation from a subject —
+    from being researched. If the rule still gets it wrong, it fails toward
+    queueing a subject and burning one run, not toward dropping one silently, and
+    `cooker status` prints the parsed count so a wrong read is visible at a glance.
     """
     p = topics_file(cfg)
     if not p.exists():
         return []
+    raw = [ln.strip() for ln in p.read_text(encoding="utf-8",
+                                             errors="replace").splitlines()]
+    raw = [ln for ln in raw if ln and not ln.startswith("#")]
+    marked_here = any(re.match(r"^([-*+]\s+\S|\d+[.)]\s+\S)", ln) for ln in raw)
     out: list[str] = []
-    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
-        s = line.strip()
-        if not s or s.startswith("#"):
+    list_started = False
+    for ln in raw:
+        marked = bool(re.match(r"^([-*+]\s+\S|\d+[.)]\s+\S)", ln))
+        text = re.sub(r"^([-*+]|\d+[.)])\s+", "", ln).strip()
+        if len(text) < 8:
             continue
-        s = re.sub(r"^[-*+]\s+", "", s).strip()
-        s = re.sub(r"^\d+[.)]\s+", "", s).strip()
-        if len(s) >= 8:
-            out.append(s)
+        if marked:
+            list_started = True
+            out.append(text)
+            continue
+        if re.search(r"[.!?]$", text):
+            continue  # a sentence, in any position
+        if marked_here and not list_started:
+            continue  # prose sitting above the list
+        out.append(text)
     return out
 
 
@@ -455,10 +488,12 @@ def chain_state(conn: sqlite3.Connection, chain_id: str) -> dict[str, Any]:
 
 
 def day_dir(cfg: Config, *, day: date | None = None) -> Path:
-    """outputs/YYYY-MM-DD/ — where published artifacts land."""
-    root = Path(str(cfg.get("safety.outputs_dir", "outputs"))).expanduser()
-    if not root.is_absolute():
-        root = Path(str(cfg.data_dir)) / root
-    d = root / (day or date.today()).strftime("%Y-%m-%d")
+    """outputs/YYYY-MM-DD/ — where published artifacts land.
+
+    Built on `cfg.outputs_dir` rather than re-resolving the knob, because the
+    quota in `safety.max_disk_gb` is measured against that property and a second
+    definition of "outputs" is how the two stopped agreeing.
+    """
+    d = cfg.outputs_dir / (day or date.today()).strftime("%Y-%m-%d")
     d.mkdir(parents=True, exist_ok=True)
     return d

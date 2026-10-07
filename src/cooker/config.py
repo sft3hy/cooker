@@ -106,8 +106,16 @@ class Config:
 
     @property
     def outputs_dir(self) -> Path:
+        """Where published artifacts land. Relative means *inside `data_dir`*.
+
+        This used to resolve against the config root, while `chains.day_dir` built
+        `data_dir/outputs` itself — so the daemon wrote 212 KB into `var/outputs/`
+        and `cooker doctor` cheerfully reported "0.0 MB of 2.0 GB" about an empty
+        `outputs/` beside it. A quota measured against the wrong directory is not a
+        quota, and the two definitions had to collapse into one.
+        """
         p = Path(self.get("safety.outputs_dir", "outputs"))
-        return p if p.is_absolute() else self.root / p
+        return p if p.is_absolute() else self.data_dir / p
 
     @property
     def db_path(self) -> Path:
