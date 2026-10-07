@@ -245,6 +245,7 @@ def cfg(**over: object) -> Config:
             "opencode_wal_seconds": 30,
             "fs_activity_seconds": 60,
             "interactive_cooldown_seconds": 60,
+            "claim_quiet_seconds": 4.0,
             "idle_confirm_seconds": 60,
             "infer_min_bps": 256,
             "wire_interval_seconds": 1.0,
@@ -363,9 +364,21 @@ async def test_keystrokes_are_busy_but_not_preempting() -> None:
 
 
 @pytest.mark.asyncio
-async def test_idle_takes_idle_confirm_before_it_says_ready() -> None:
-    """No hysteresis here and the kitchen starts the instant you stop typing,
-    which is the definition of a noisy neighbour."""
+async def test_idle_needs_a_measured_pause_before_it_says_ready() -> None:
+    """Hysteresis, with the number taken from the machine instead of guessed.
+
+    Without hysteresis the kitchen starts the instant you stop typing, which is the
+    definition of a noisy neighbour. With sixty seconds of it the kitchen never
+    starts at all: measured during a live agent session, the gaps between bursts are
+    2-5s (DISCOVERY §16), so a 60s gate refused every tick of a trace in which 33%
+    of the time nothing was being served.
+
+    So the claim gate is `claim_quiet_seconds` - four seconds, past the typical next
+    burst and the shortest interval a 3s window polled every 2s could honestly report -
+    while `idle_confirm_seconds` keeps its original meaning as the gate on
+    *concurrency*, which is the request that shares a generation's throughput rather
+    than queueing behind it.
+    """
     c, clk, sc = cfg(), Clock(), Scripted()
     d = make(c, None, sc, clk)
     sc.push(up(Signals(ts=clk.t, hid_idle_s=5.0)))
@@ -376,27 +389,38 @@ async def test_idle_takes_idle_confirm_before_it_says_ready() -> None:
     state = await d.tick()
     assert state.state == IDLE
     assert not state.ready, "quiet is not the same as proven quiet"
-    assert any("idle confirm" in b for b in state.blockers)
+    assert any("quiet 4s" in b for b in state.blockers), state.blockers
+    assert state.quiet_s == 0.0
 
-    clk.advance(59)
+    clk.advance(3)
+    sc.push(up(Signals(ts=clk.t, hid_idle_s=440.0)))
+    state = await d.tick()
+    assert not state.ready, "three seconds is still inside the typical next burst"
+
+    clk.advance(1)
     sc.push(up(Signals(ts=clk.t, hid_idle_s=459.0)))
     state = await d.tick()
-    assert not state.ready, "one second short"
+    assert state.ready, "four measured seconds of quiet earns one bounded stage"
+    assert not state.ramped, "and nowhere near enough for four"
+    assert "idle confirm" in state.ramp_note, state.ramp_note
 
-    clk.advance(2)
-    sc.push(up(Signals(ts=clk.t, hid_idle_s=461.0)))
+    clk.advance(57)
+    sc.push(up(Signals(ts=clk.t, hid_idle_s=516.0)))
     state = await d.tick()
-    assert state.ready, f"should be ready, blockers={state.blockers}"
+    assert state.ready and state.ramped, "a minute of quiet earns the ladder"
 
 
 @pytest.mark.asyncio
-async def test_cooldown_runs_from_when_we_saw_the_socket_clear() -> None:
-    """Two clocks, and the conservative reading of each.
+async def test_cooldown_gates_the_ramp_and_not_the_first_pot() -> None:
+    """Two clocks, now answering two different questions.
 
     The cooldown starts when we *observe* inference stop, not when we last saw it
-    running: between those two ticks we have no idea what happened, and guessing
-    'it stopped at the last thing I saw' is a 1-second bet with someone else's
-    latency on the other side of it. idle_confirm then runs from the same moment.
+    running: between those ticks we have no idea what happened, and guessing "it
+    stopped at the last thing I saw" is a one-second bet with someone else's latency
+    on the other side. What the measurement changed is what that bet stakes. A
+    bounded stage started too early costs a measured +95ms median and +200ms when
+    fired into a live decode, so the cooldown no longer withholds the first pot.
+    Concurrency genuinely does share a decode, so the cooldown still withholds that.
     """
     c, clk, sc = cfg(), Clock(), Scripted()
     d = make(c, None, sc, clk)
@@ -408,20 +432,21 @@ async def test_cooldown_runs_from_when_we_saw_the_socket_clear() -> None:
     sc.push(up(Signals(ts=clk.t)))
     state = await d.tick()
     assert state.state == IDLE, "the socket is clear"
-    assert not state.ready
-    assert "cooldown 60s" in state.blockers, state.blockers
-    assert "idle confirm 60s" in state.blockers, state.blockers
+    assert not state.ready, "the pause has only just begun"
+    assert "cooldown 60s" in state.ramp_note, state.ramp_note
+    assert "idle confirm 60s" in state.ramp_note, state.ramp_note
 
-    clk.advance(59)
+    clk.advance(4)
     sc.push(up(Signals(ts=clk.t)))
     state = await d.tick()
-    assert not state.ready, "one second short of both clocks"
-    assert any(b.startswith("cooldown ") for b in state.blockers)
+    assert state.ready, "one bounded stage fits, and the collision is cheap"
+    assert not state.ramped, "two pots still wait for the cooldown"
+    assert "cooldown" in state.ramp_note, state.ramp_note
 
-    clk.advance(2)
+    clk.advance(57)
     sc.push(up(Signals(ts=clk.t)))
     state = await d.tick()
-    assert state.ready, f"both clocks spent, got {state.blockers}"
+    assert state.ready and state.ramped, f"both clocks spent, got {state.ramp_note}"
 
 
 @pytest.mark.asyncio
@@ -493,3 +518,41 @@ async def test_live_sampler_reads_the_real_machine() -> None:
     assert sig.socks.listening, "something listens on :8000 on this box"
     assert "sockets" not in sig.failed
     assert sig.cost_ms, "probe cost must be tracked, it is a budgeted resource"
+
+
+@pytest.mark.asyncio
+async def test_quiet_streaks_are_recorded_as_burst_structure() -> None:
+    """The gap distribution, kept, because one threshold cannot describe it.
+
+    `cooker status` should be able to say "this machine pauses for two seconds at a
+    time" rather than "not ready", and stage sizing eventually needs the same number:
+    a stage that cannot finish inside the typical gap should not be claimed at all,
+    because a preempted stage pays for its prompt and delivers nothing. A streak is
+    retired the moment traffic resumes, which is the only instant at which its
+    length is known.
+    """
+    c, clk, sc = cfg(), Clock(), Scripted()
+    d = make(c, None, sc, clk)
+    assert d.typical_gap_s is None, "no history yet, so no opinion"
+
+    sc.push(up(Signals(ts=clk.t)))
+    await d.tick()                      # quiet begins
+    clk.advance(5)
+    sc.push(serving(up(Signals(ts=clk.t, socks=connected(cooking())))))
+    await d.tick()                      # burst ends the first streak
+    assert list(d.quiet_streaks) == [5.0], d.quiet_streaks
+
+    clk.advance(3)
+    sc.push(up(Signals(ts=clk.t)))
+    await d.tick()                      # quiet again
+    clk.advance(9)
+    sc.push(serving(up(Signals(ts=clk.t, socks=connected(cooking())))))
+    await d.tick()                      # second streak retired
+    assert list(d.quiet_streaks) == [5.0, 9.0], d.quiet_streaks
+    assert d.typical_gap_s == 5.0, "conservative middle, not the optimistic one"
+
+    clk.advance(2)
+    sc.push(up(Signals(ts=clk.t)))
+    state = await d.tick()
+    assert state.typical_gap_s == 5.0, "the snapshot carries it, so the runner need not"
+    assert state.quiet_s is not None and state.quiet_s == 0.0

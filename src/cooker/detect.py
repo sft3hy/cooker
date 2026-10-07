@@ -36,6 +36,7 @@ import os
 import re
 import subprocess  # fixed argv only: no shell, no interpolation
 import time
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -546,6 +547,24 @@ class BusState:
     # "why did the kitchen stop", and only one of them is a lie waiting to happen.
     wire_up: bool = False
     cooking: tuple[str, ...] = ()
+    # `ready` means one bounded stage may start; `ramped` means the concurrency
+    # ladder may climb past one. They were the same flag until the gap distribution
+    # was measured (DISCOVERY §16), because a four-second pause is enough for a
+    # `plan` stage and nowhere near enough for three workers, and a single boolean
+    # has to answer both by being wrong about one of them.
+    ramped: bool = False
+    # How long the wire has been known quiet, for the UI and for stage sizing.
+    quiet_s: float | None = None
+    # Why concurrency is still one when `ready` is true. Kept separate from
+    # `blockers` because a blocker that appears while the kitchen is already
+    # cooking is a contradiction the UI cannot render honestly.
+    ramp_note: str = ""
+    # The median of recently completed quiet streaks, copied out of the detector at
+    # each snapshot. Carried on the state rather than read off the detector by
+    # callers because the UI should be able to explain "why only one pot" from the
+    # payload it already has, and stage sizing needs the number at claim time, when
+    # the detector object is not in scope in the runner.
+    typical_gap_s: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -558,6 +577,11 @@ class BusState:
             "clients": list(self.clients),
             "wire_up": self.wire_up,
             "cooking": list(self.cooking),
+            "ramped": self.ramped,
+            "quiet_s": round(self.quiet_s, 1) if self.quiet_s is not None else None,
+            "ramp_note": self.ramp_note,
+            "typical_gap_s": (round(self.typical_gap_s, 1)
+                              if self.typical_gap_s is not None else None),
         }
 
 
@@ -587,13 +611,42 @@ class Detector:
         self.fs_seconds = float(cfg.get("detect.fs_activity_seconds", 60))
         self.cooldown = float(cfg.get("detect.interactive_cooldown_seconds", 60))
         self.idle_confirm = float(cfg.get("detect.idle_confirm_seconds", 60))
+        # How long the wire must be *known* quiet before one bounded stage may
+        # start. 4s is measured, not chosen: the gap distribution during a live
+        # agent session is 2-5s with a median of 2.2s (DISCOVERY §16), so 4s is
+        # already past the typical next burst and selects for "this session has
+        # actually paused". It also has to clear the meter's own latency - the
+        # wire window is 3s and the poll 2s - so anything under ~4s is a number
+        # the detector could not have observed.
+        self.claim_quiet = float(cfg.get("detect.claim_quiet_seconds", 4.0))
         self.floor_bps = float(cfg.get("detect.infer_min_bps", 256))
         self.state = IDLE
         self.reason = "startup"
         self.signals = Signals()
         self.last_infer_end: float | None = None
         self.quiet_since: float | None = None
+        # Every completed quiet streak, newest last. This is the burst structure of
+        # the machine: the thing `idle_confirm` was guessing at with one number.
+        # Bounded because a daemon that remembers every pause of a five-year-old
+        # session is a daemon whose status line is a histogram nobody reads.
+        self.quiet_streaks: deque[float] = deque(maxlen=64)
         self.last_event: dict[str, Any] = {}
+
+    @property
+    def typical_gap_s(self) -> float | None:
+        """Median length of completed quiet streaks.
+
+        The honest ceiling on how long a stage may run is not a policy number, it is
+        however long this machine tends to stay quiet - and that is a fact about a
+        particular Tuesday afternoon, not a constant. Median rather than mean because
+        one lucky two-minute pause overnight should not make the daytime
+        optimistic. Lower middle on an even count, deliberately: err toward a stage
+        that finishes early rather than one that gets preempted and pays for its
+        prompt twice."""
+        if not self.quiet_streaks:
+            return None
+        vals = sorted(self.quiet_streaks)
+        return vals[(len(vals) - 1) // 2]
 
     # --- classification ---
 
@@ -653,6 +706,10 @@ class Detector:
             if self.quiet_since is None:
                 self.quiet_since = now
         else:
+            if self.quiet_since is not None:
+                # The streak is retired here, at the moment it ends, because after
+                # this tick we no longer know when it started.
+                self.quiet_streaks.append(now - self.quiet_since)
             self.quiet_since = None
 
         if self.state == ACTIVE_INFER and state != ACTIVE_INFER:
@@ -668,10 +725,26 @@ class Detector:
         return self.snapshot()
 
     def snapshot(self) -> BusState:
+        """Two gates, because there are two questions.
+
+        `ready` asks whether *one bounded stage* may go on the GPU. The measured
+        answer is about four quiet seconds (DISCOVERY §16): the gap distribution
+        during a live agent session is 2-5s, so four seconds is already past the
+        typical next burst, and the meter could not have observed anything shorter
+        anyway with a 3s window polled every 2s. `ramped` asks whether *more than
+        one* pot may burn, and that one genuinely does want the minute, because
+        concurrency shares decode throughput rather than merely queueing behind.
+
+        These were one flag until today, which is how `cooker run --live` came to be
+        blocked on 180 of 180 ticks while a third of that time was genuinely idle: a
+        single boolean answering both questions is wrong about one of them by
+        construction.
+        """
         now = self.clock()
-        blockers: list[str] = []
         sig = self.signals
 
+        # Hard blockers first: facts that make any work wrong right now.
+        blockers: list[str] = []
         if self.state != IDLE:
             blockers.append(self.reason)
         if "sockets" in set(sig.failed):
@@ -679,26 +752,34 @@ class Detector:
         if not sig.omlx_up:
             blockers.append("omlx offline")
 
+        quiet_s = (now - self.quiet_since) if self.quiet_since is not None else None
         ready_in = 0.0
+        if not blockers:
+            if quiet_s is None:
+                blockers.append(f"quiet {self.claim_quiet:.0f}s")
+                ready_in = self.claim_quiet
+            elif quiet_s < self.claim_quiet:
+                ready_in = self.claim_quiet - quiet_s
+                blockers.append(f"quiet {ready_in:.0f}s")
+        elif quiet_s is not None:
+            ready_in = max(0.0, self.claim_quiet - quiet_s)
+
+        ready = self.state == IDLE and not blockers
+
+        ramp: list[str] = []
         if self.last_infer_end is not None:
             left = self.cooldown - (_age_then(self.last_infer_end, now) or 0.0)
             if left > 0:
-                blockers.append(f"cooldown {left:.0f}s")
-                ready_in = max(ready_in, left)
-        if self.quiet_since is None:
-            blockers.append(f"idle confirm {self.idle_confirm:.0f}s")
-            ready_in = max(ready_in, self.idle_confirm)
-        else:
-            left = self.idle_confirm - (_age_then(self.quiet_since, now) or 0.0)
-            if left > 0:
-                blockers.append(f"idle confirm {left:.0f}s")
-                ready_in = max(ready_in, left)
+                ramp.append(f"cooldown {left:.0f}s")
+        if quiet_s is None or quiet_s < self.idle_confirm:
+            ramp.append(f"idle confirm {self.idle_confirm - (quiet_s or 0.0):.0f}s")
+        ramped = ready and not ramp
 
         return BusState(
             state=self.state,
             reason=self.reason,
             blockers=tuple(blockers),
-            ready=self.state == IDLE and not blockers,
+            ready=ready,
             ready_in_s=ready_in,
             ts=now,
             hid_idle_s=sig.hid_idle_s or 0.0,
@@ -706,6 +787,10 @@ class Detector:
             wire_up=sig.wire_up,
             cooking=tuple(str(c) for c in
                           (sig.socks.generating(self.floor_bps) if sig.socks else ())),
+            ramped=ramped,
+            quiet_s=quiet_s,
+            ramp_note="; ".join(ramp) if not ramped else "",
+            typical_gap_s=self.typical_gap_s,
         )
 
     def _event(self, type_: str, message: str, *, severity: str, data: dict) -> None:

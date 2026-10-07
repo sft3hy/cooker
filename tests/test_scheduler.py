@@ -69,10 +69,15 @@ class FakeDetector:
     """Stands in for the real detector so state transitions are scripted rather
     than waited for."""
 
-    def __init__(self, state: str = detect.IDLE, ready: bool = True) -> None:
+    def __init__(self, state: str = detect.IDLE, ready: bool = True,
+                 ramped: bool = True) -> None:
         self.state = state
         self.reason = "test"
         self.ready = ready
+        # Default True so the ramp tests say "this box has been quiet a minute"
+        # without every one of them having to. A ready-but-not-ramped machine is a
+        # distinct state and gets its own test below rather than being the default.
+        self.ramped = ramped
         self.signals = detect.Signals(cost_ms={})
         self.tick_count = 0
 
@@ -85,6 +90,7 @@ class FakeDetector:
             state=self.state, reason=self.reason,
             blockers=() if self.ready else ("blocked: scripted",),
             ready=self.ready, ready_in_s=0.0, ts=time.time(),
+            ramped=self.ramped,
         )
 
     def go(self, state: str, ready: bool = False) -> None:
@@ -339,3 +345,28 @@ async def test_summary_is_the_payload_the_ui_needs(conn) -> None:
     assert s["runnable_now"] >= 1
     assert isinstance(s["slots"], list)
     assert "p95_ttft_s" in s and "cost_ms" in s
+
+
+@pytest.mark.asyncio
+async def test_ready_but_not_ramped_runs_exactly_one_pot(conn) -> None:
+    """The gate that the measured gap distribution bought.
+
+    A four-second pause is long enough for one bounded stage - a collision costs the
+    human +95ms median, measured - and nowhere near long enough to conclude the
+    machine is free for four concurrent decodes, because concurrency does not queue
+    behind a generation, it shares its decode throughput. So `ready` opens one burner
+    and `ramped` is what lets the ladder climb. Without this distinction the only
+    honest options are to refuse work that was safe or to flood a busy box.
+    """
+    seed(conn, 20)
+    det = FakeDetector(ready=True, ramped=False)
+    sched = Scheduler(cfg(max_concurrency=4, dry_run_stage_seconds=60), conn, det)
+    counts = []
+    for _ in range(5):
+        await sched.tick()
+        counts.append(len(sched.slots))
+    assert counts == [1, 1, 1, 1, 1], f"not ramped must pin at one: {counts}"
+    det.go(detect.IDLE, ready=True)
+    det.ramped = True
+    await sched.tick()
+    assert len(sched.slots) == 2, "ramped must release the ladder"

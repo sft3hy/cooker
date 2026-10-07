@@ -70,6 +70,14 @@ detect:
   # A stage in flight is allowed to finish under ACTIVE_USER (work is not
   # thrown away), but never longer than this.
   max_stage_seconds: 180
+  # How long the wire must be known quiet before ONE bounded stage may start.
+  # 4s is measured, not picked (DISCOVERY §16): during a live agent session the
+  # gaps between bursts run 2-5s with a median of 2.2s, so four seconds is already
+  # past the typical next burst, and it is also the shortest interval this meter
+  # can honestly report - a 3s window polled every 2s cannot have seen 2s.
+  # Measured cost when it is wrong: +95ms median, +200ms into a live decode, +350ms
+  # for a second large prefill, against a 750ms budget.
+  claim_quiet_seconds: 4.0
   user_idle_seconds: 120        # HID quieter than this => not ACTIVE_USER
   opencode_wal_seconds: 30      # WAL touched within this => ACTIVE_USER
   fs_activity_seconds: 60       # a file saved within this => ACTIVE_USER

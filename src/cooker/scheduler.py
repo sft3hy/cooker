@@ -175,13 +175,21 @@ class Scheduler:
         idx = max(0, round(0.95 * len(rows)) - 1)
         return float(rows[idx]["ttft_ms"]) / 1000.0
 
-    def desired_workers(self, state: str, ready: bool) -> tuple[int, list[str]]:
+    def desired_workers(self, state: str, ready: bool,
+                        ramped: bool = True) -> tuple[int, list[str]]:
         notes: list[str] = []
         if state == ACTIVE_INFER:
             return 0, notes
         if not ready:
             return 0, notes
         cap = self.max_workers
+        # One pot until the machine has been quiet long enough to be trusted with
+        # two. `ready` means a bounded stage fits in the pause; `ramped` means the
+        # pause looks durable. Concurrency is the expensive request: it does not
+        # queue behind a generation, it shares the decode throughput with it, so the
+        # gate that lets it in has to be the slow one.
+        if not ramped:
+            cap = min(cap, 1)
         p95 = self._p95_ttft()
         if p95 is not None and p95 > self.latency_ceiling:
             cap = max(self.min_workers, cap // 2)
@@ -220,7 +228,8 @@ class Scheduler:
         if state.state == ACTIVE_INFER and self.slots:
             preempted = self._preempt_all(now, state.reason)
 
-        want, want_notes = self.desired_workers(state.state, ready)
+        want, want_notes = self.desired_workers(state.state, ready,
+                                                 ramped=state.ramped and not self.paused_note)
         notes.extend(want_notes)
 
         if ready:
