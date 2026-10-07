@@ -753,3 +753,36 @@ authenticate `/v1` (401), and the admin session does not either — two auth
 domains, two keys, both in the autoresearch `.env`; the key is never committed
 and never in the plist (the daemon reads the same file ladder as the inference
 key).
+
+## §20b The presence curfew is struck — the wall is GPU access (owner's amendment, 2026-10-07)
+
+Sam, verbatim: *"it should run when I'm using the computer, just not when I'm
+hitting omlx via anything."* The commandment was always "interactive always
+wins"; the implementation had grown it into a curfew — `hid < 120`, a fresh
+WAL, a saved file, any :4096 subscriber — and the kitchen closed the moment
+anyone touched the desk (`waiting — activity on the box`, 12:25:52, his doing,
+his machine, his call). Amended: **the blockers are GPU traffic and blindness
+to it. Nothing else.**
+
+- `detect.presence_blocks: false` (config default; the code default stays
+  true so a sparse config fails conservative). HID/WAL/fs/:4096 are now
+  *annotation*: the reason reads `monitor traffic: 4,147 B/s, ledger idle ·
+  human present: hid 0s` — the kitchen lit while hands are on keys, saying
+  who is home rather than pretending nobody is. Legacy regime stays pinned by
+  tests on the knob.
+- The collision this accepts is the measured one (§16): +95 ms median TTFT,
+  +350 ms into a prefill race — inside the 750 ms budget that was always the
+  bar. What still stops work cold: the ledger's `active − own > 0` / waiting,
+  unexplained bytes inside the idle margin, and blind (blind ≠ quiet, ever).
+- Deployed live proof, same sitting: `ready to cook` 12:33:03 while he typed;
+  then a full research chain — plan 68 tok, search, fetch, extract × N,
+  **synthesize 3,455 tok in 18.2 s**, critique — with the ledger preempting
+  and resuming around my own session traffic exactly as designed.
+- **And a third bug, caught only because the gate finally let anything through:**
+  the queue was starving with `ready` printed — `cooker resume` writes
+  `paused=''`, and `seed_research_if_thirsty` asked `get_meta(...) is not
+  None` while the scheduler asked `in (None,"","0")`. A resumed box answered
+  *"paused"* to the seed forever. One definition now: `db.is_paused`, with the
+  regression test the old test-suite dodged by deleting the meta instead of
+  resuming. Landmine #9, second sentence: *an empty meta row is not a pause
+  order.*

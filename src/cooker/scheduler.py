@@ -156,8 +156,7 @@ class Scheduler:
     # --- policy ---------------------------------------------------------
 
     def _paused(self) -> str | None:
-        note = db.get_meta(self.conn, "paused")
-        return None if note in (None, "", "0") else note
+        return db.is_paused(self.conn)
 
     def _p95_ttft(self) -> float | None:
         """Our own background p95, from the rows we wrote. None until we have

@@ -249,6 +249,7 @@ def cfg(**over: object) -> Config:
             "claim_quiet_seconds": 4.0,
             "idle_confirm_seconds": 60,
             "infer_min_bps": 256,
+            "presence_blocks": True,
             "wire_interval_seconds": 1.0,
             "wire_window_seconds": 3.0,
             "ledger": {
@@ -682,9 +683,10 @@ async def test_the_reset_window_has_an_edge() -> None:
 
 @pytest.mark.asyncio
 async def test_a_typing_human_outranks_monitor_traffic() -> None:
-    """Order of judges: the ledger's 'nobody is generating' is not 'nobody is
-    coming back'. HID evidence still outranks the calmest ledger, because the
-    gate is about what happens next, not only about what is happening now."""
+    """LEGACY MODE (§20b knob): with `presence_blocks: true` the pre-amendment
+    order of judges still holds — HID outranks the calmest ledger. The shipped
+    default flipped to false on 2026-10-07 by the owner; this test keeps the
+    old regime pinned for anyone who flips the knob back."""
     c, clk, sc = cfg(), Clock(), Scripted()
     d = make(c, None, sc, clk)
     sig = with_ledger(metronome(clk))
@@ -692,6 +694,58 @@ async def test_a_typing_human_outranks_monitor_traffic() -> None:
     sc.push(sig)
     state = await d.tick()
     assert state.state == ACTIVE_USER, state.reason
+    assert not state.ready
+
+
+@pytest.mark.asyncio
+async def test_the_amendment_hands_on_keys_do_not_close_the_kitchen() -> None:
+    """§20b, the owner's contract: "it should run when I'm using the computer,
+    just not when I'm hitting omlx via anything." Typing, browsers, compiles —
+    the kitchen stays lit and reaches ready on the GPU-quiet clock, and the
+    reason says who is home instead of pretending nobody is.
+    """
+    c, clk, sc = cfg(presence_blocks=False), Clock(), Scripted()
+    d = make(c, None, sc, clk)
+    sig = with_ledger(metronome(clk))
+    sig.hid_idle_s = 3.0
+    sig.oc_wal_age_s = 2.0
+    sc.push(sig)
+    state = await d.tick()
+    assert state.state == IDLE, f"presence must not block: {state.reason}"
+    assert "human present" in state.reason, state.reason
+    assert not state.ready, "the four-second GPU-quiet clock still runs"
+    for _ in range(4):
+        clk.advance(1)
+        sig = with_ledger(metronome(clk), idle_s=44.0)
+        sig.hid_idle_s = 7.0
+        sc.push(sig)
+        state = await d.tick()
+    assert state.ready, f"hands on keys, GPU quiet four seconds: {state.blockers}"
+
+
+@pytest.mark.asyncio
+async def test_the_amendment_still_blinds_itself_safely() -> None:
+    """Blind is not presence. With presence_blocks off — the amendment — a
+    deaf nettop must still stop new work, because unwatched bytes are exactly
+    what the GPU was promised protection from, presence or no presence."""
+    c, clk, sc = cfg(presence_blocks=False), Clock(), Scripted()
+    d = make(c, None, sc, clk)
+    sc.push(up(Signals(ts=clk.t, socks=connected(Peer(85164, "opencode", 0.0))),
+               wire=False))
+    state = await d.tick()
+    assert state.state == ACTIVE_USER, state.reason
+    assert "blind" in state.reason
+
+
+@pytest.mark.asyncio
+async def test_gpu_traffic_under_the_amendment_still_preempts() -> None:
+    """The other half of the amendment: "not when I'm hitting omlx" is now
+    the *whole* blocker — the ledger's word holds the line at full strength."""
+    c, clk, sc = cfg(presence_blocks=False), Clock(), Scripted()
+    d = make(c, None, sc, clk)
+    sc.push(with_ledger(up(Signals(ts=clk.t)), active=1, idle_s=0.2))
+    state = await d.tick()
+    assert state.state == ACTIVE_INFER, state.reason
     assert not state.ready
 
 

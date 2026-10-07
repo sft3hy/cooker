@@ -88,7 +88,10 @@
     } else if (g.state === 'ACTIVE_INFER') {
       banner = 'paused — someone is generating';
     } else if (g.state === 'ACTIVE_USER') {
-      banner = 'waiting — activity on the box';
+      // since §20b only blindness lands here — typing does not. say so.
+      banner = (g.reason || '').includes('blind')
+        ? 'blind — cannot see the GPU'
+        : 'waiting — presence blocks (legacy mode)';
     } else if ((state.workers?.slots || []).length) {
       banner = `cooking — ${state.workers.slots.length} stage(s) on`;
     } else if (g.ready && !g.ramped) {

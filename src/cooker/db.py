@@ -568,6 +568,18 @@ def get_meta(conn: sqlite3.Connection, key: str, default: str | None = None) -> 
     return row["value"] if row else default
 
 
+def is_paused(conn: sqlite3.Connection) -> str | None:
+    """The ONE definition of paused. `cooker resume` writes the empty string,
+    so "present but empty" is resumed — a check of `is not None` here used to
+    read a resumed box as paused forever, and the queue starved with the gate
+    open (2026-10-07: the gate opened at 12:33, seeded nothing, because
+    `seed_research_if_thirsty` asked this question a second, different way).
+    Read `paused: 0` as resumed too; absent is resumed, always.
+    """
+    note = get_meta(conn, "paused")
+    return None if note in (None, "", "0") else note
+
+
 def merge_payload(conn: sqlite3.Connection, task_id: str,
                   patch: dict[str, Any]) -> dict[str, Any]:
     """Merge a patch into a stage's payload and return the result.

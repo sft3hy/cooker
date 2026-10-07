@@ -672,6 +672,16 @@ class Detector:
         # the detector could not have observed.
         self.claim_quiet = float(cfg.get("detect.claim_quiet_seconds", 4.0))
         self.floor_bps = float(cfg.get("detect.infer_min_bps", 256))
+        # Amended 2026-10-07 by the owner: "it should run when I'm using the
+        # computer, just not when I'm hitting omlx via anything." Presence
+        # evidence (HID, WAL, fs, :4096 sockets) still gets *read* — the UI
+        # shows the kitchen lit while hands are on the keys, because that is
+        # the truth of the new contract — but only omlx traffic and blindness
+        # to omlx traffic block. Code default is the old conservative regime;
+        # config.yaml carries the owner's amendment. The collision this now
+        # tolerates is measured, not hoped: +95ms median TTFT, +350ms on a
+        # prefill race (§16), inside the 750ms budget that was always the bar.
+        self.presence_blocks = bool(cfg.get("detect.presence_blocks", True))
         # How long after a completion the ledger still calls the model "recently
         # active" when unexplained bytes are on the wire: a poll interval's
         # worth of benefit of the doubt for the request the counters missed
@@ -730,7 +740,10 @@ class Detector:
         return ev
 
     def _classify(self, sig: Signals) -> tuple[str, str]:
-        """Strictest wins: inference > user > idle.
+        """Strictest wins: inference > user > idle — where "user" since the
+        owner's amendment (§20b) only means *blind*: not seeing the GPU is a
+        reason to stop, but typing, compiling and browsing are not. Presence
+        evidence survives as annotation on the quiet verdict.
 
         Two judges, in a deliberate order (§20). When the ledger is *up*, the
         server answers for itself: inference is happening iff it says somebody
@@ -797,8 +810,14 @@ class Detector:
                     return ACTIVE_USER, "blind: no throughput data, cannot tell 0 from unknown"
                 return IDLE, f"keepalive: {peer_summary(clients)}"
         ev = self._user_evidence(sig)
-        if ev:
+        if ev and self.presence_blocks:
             return ACTIVE_USER, " · ".join(ev)
+        if ev:
+            # The owner's amendment (§20b): hands on the keyboard are not a
+            # blocker, they are context. Say who is home without stopping the
+            # burn — a UI that shows "quiet" while the human types would be a
+            # cleaner lie, and the ledger already stopped us making that one.
+            note = (note + " · " if note else "") + f"human present: {', '.join(ev[:2])}"
         return IDLE, note or "quiet"
 
     # --- the tick ---

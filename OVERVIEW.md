@@ -16,9 +16,11 @@ The primary interactive client is **OpenCode**.
 
 ### Core principle
 
-> **Interactive work always wins. Background work uses only capacity that is currently safe to consume.**
+> **Interactive GPU work always wins. Being at the computer is not hitting the GPU. Background work runs whenever omlx itself is not being asked for anything.**
 
-Cooker is a polite sidecar client. It must never wrap, intercept, or supersede OpenCode or omlx. It simply watches for human activity, and when detected, it drops its own requests and backs off so OpenCode has full use of the LLM.
+*(Amended 2026-10-07 by Sam, verbatim: "it should run when I'm using the computer, just not when I'm hitting omlx via anything." The original clause read "Interactive work always wins" and the implementation had grown it into a presence curfew — HID, WAL and filesystem evidence closed the kitchen whenever a human was anywhere near the keyboard, which starved the daemon at its own desk.)*
+
+Cooker is a polite sidecar client. It must never wrap, intercept, or supersede OpenCode or omlx. It watches **what reaches the GPU** — the server's ledger first (§20), bytes as tripwire, both failing closed — and when the GPU is being asked for anything it drops its own requests and backs off so the interactive client has full use of the LLM. Hands on the keyboard, browsers, compiles: not the GPU's business, not the kitchen's either.
 
 ---
 
@@ -124,20 +126,34 @@ Crucially, include **DAG support**:
 
 Cooker does not control omlx. It only controls itself. 
 
-## 3.1 Passive Interactive Detection
+## 3.1 Passive GPU-Access Detection
 
-Use lightweight, passive signals to detect if OpenCode (or the user) is working:
+Signals, ranked by what they can actually prove (every demotion below was earned
+by a live failure, DISCOVERY §11–§20):
 
-1. **omlx Port Activity**: Poll `lsof -i :<omlx_port>` or `netstat`. If there are active TCP connections to omlx that do *not* belong to Cooker's PID, OpenCode is generating.
-2. **System Idle Time**: Use macOS `ioreg -c IOHIDSystem` to check if the user is actively typing or moving the mouse.
-3. **File System Activity**: Check if files in `~/dev` have been saved in the last X seconds.
+1. **omlx ledger (primary)**: `GET /admin/api/stats` — `total_active_requests`,
+   `generating[]`, per-model `idle_seconds`. The server's own memory; monitors
+   provably never move it, a 0.26-second completion does (§20). This is what
+   answers "is anyone hitting omlx".
+2. **Wire bytes (tripwire + blind-mode judge)**: `nettop` per-flow across
+   :8000 with an endpoint filter. Bytes prove traffic, never purpose — they
+   preempt a running stage (cheap, +95ms measured) and they stand the kitchen
+   down when the ledger is blind, but they do not classify while the ledger can
+   answer.
+3. **Presence signals (annotation only, since §20b)**: HID idle, opencode WAL
+   freshness, filesystem saves, :4096 subscribers. Read for the UI ("human
+   present") and for the legacy `presence_blocks: true` regime; **they block
+   nothing.** A connected socket is a relationship, not an event; a heartbeat
+   is neither. `lsof ESTABLISHED` to omlx never meant "OpenCode is
+   generating" — that sentence is deleted from this spec, twice measured wrong
+   (§6, §11).
 
 ## 3.2 Self-Preemption
 
 If Cooker detects interactive work while it is running a background task:
 1. **Drop the connection**: Cooker immediately cancels its own `asyncio` HTTP request to omlx. (Assuming omlx kills generation on client disconnect).
 2. Mark the task as `PAUSED` and increment `preemptions`.
-3. Enter a cooldown phase (e.g., wait 60 seconds after the last detected OpenCode activity before sending any new requests).
+3. Enter a cooldown phase (e.g., wait 60 seconds after the last detected GPU activity — `ACTIVE_INFER` ending, not the last keystroke — before sending any new requests).
 
 Design tasks in **resumable stages** (`search → fetch → synthesize`) so cancelling mid-generation loses minimal work.
 
@@ -145,10 +161,14 @@ Design tasks in **resumable stages** (`search → fetch → synthesize`) so canc
 
 Cooker monitors its own request latency.
 ```text
-IDLE (User away) -> +1 background worker (up to configured max)
-ACTIVE (User typing) -> Pause all Cooker generation
-ACTIVE (OpenCode generating) -> Abort Cooker generation instantly
+IDLE (GPU unclaimed — ledger idle, bytes quiet) -> +1 background worker (to max)
+READY  (keyboard busy, GPU idle)                  -> keep cooking (§20b, 2026-10-07)
+ACTIVE_INFER (anything hitting omlx)              -> Abort Cooker generation instantly
+BLIND (cannot see the GPU)                        -> finish in flight, start nothing
 ```
+*The old middle line — typing pauses everything — was the presence curfew
+Sam struck on 2026-10-07; the keyboard never had claims on the GPU, only
+the wire does.*
 
 ---
 

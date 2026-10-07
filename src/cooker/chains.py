@@ -275,7 +275,7 @@ def seed_research_if_thirsty(cfg: Config, conn: sqlite3.Connection,
     generator is disabled — three different silences that must be distinguishable
     in the log, because "it never cooked" needs an answer that isn't a shrug.
     """
-    if db.get_meta(conn, "paused") is not None:
+    if db.is_paused(conn) is not None:
         return []
     if not bool(cfg.get("generators.research.enabled", True)):
         return []

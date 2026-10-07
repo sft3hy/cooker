@@ -194,6 +194,26 @@ def test_seed_refuses_when_paused_and_falls_back_when_out_of_topics(
     conn.close()
 
 
+def test_resume_leaves_the_kitchen_thirsty_not_paused(tmp_path: Path) -> None:
+    """`cooker resume` writes paused='' — the seed must read it as resumed.
+
+    The live starvation of 2026-10-07: the gate opened, `ready` printed, and
+    nothing queued ever again, because the seed asked "is it paused" a second,
+    different way from the scheduler and a resumed box answered "yes" forever.
+    Two definitions of one state is the bug; `db.is_paused` is the fix.
+    """
+    c = cfg(tmp_path)
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    db.set_meta(conn, "paused", "before the pause")
+    assert chains.seed_research_if_thirsty(c, conn) == []
+    db.set_meta(conn, "paused", "")        # exactly what `cooker resume` leaves
+    assert db.is_paused(conn) is None
+    made = chains.seed_research_if_thirsty(c, conn)
+    assert len(made) == 1, "resume must resume, not starve the queue"
+    conn.close()
+
+
 # --- the edges ----------------------------------------------------------
 
 

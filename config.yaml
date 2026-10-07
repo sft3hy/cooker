@@ -60,6 +60,14 @@ detect:
   # comfortably above keepalive noise. Too high and we cook over a generation;
   # too low and a stray ACK freezes the kitchen.
   infer_min_bps: 256
+  # Amended 2026-10-07, owner's decision (Sam): "it should run when I'm using
+  # the computer, just not when I'm hitting omlx via anything." Presence
+  # evidence — HID, opencode WAL, fs, :4096 subscribers — is now annotation
+  # only; the blockers are GPU traffic (ledger, then bytes when blind) and
+  # blindness to it. The collision this accepts is measured (§16): +95ms
+  # median TTFT, +350ms prefill race, inside the 750ms budget. Set true to
+  # restore the M2-era manners.
+  presence_blocks: false
   load_proc_names: [omlx, opencode]
   # Ordered URLs to try, best first. https/home.arpa beats raw IPs, which
   # beat loopback (occupied by a stray http.server on this host).

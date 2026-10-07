@@ -20,9 +20,12 @@ fronted by a **fun 8-bit pixel-kitchen web UI**, live at
 
 Two constraints outrank every feature:
 
-1. **Interactive always wins.** If a human or another agent is using the GPU, Cooker
-   does not start, and if it is mid-stage it drops the HTTP connection. It is
-   a guest in someone else's house.
+1. **Interactive GPU work always wins — and only GPU work.** Amended 2026-10-07
+   by Sam (§20b): "it should run when I'm using the computer, just not when I'm
+   hitting omlx via anything." If anything is asking omlx for anything, Cooker
+   does not start, and if it is mid-stage it drops the HTTP connection. Typing,
+   browsing, compiling: not the kitchen's business. It is a guest in someone
+   else's house — the GPU is the house, not the desk.
 2. **Verification must be honest.** Never report a PASS, a test count, a file, or a
    commit that was not actually produced. This has gone wrong twice (M5, and once
    mid-M4). `PLAN.md` and `DISCOVERY.md` are the record; if they disagree with disk,
