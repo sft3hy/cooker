@@ -23,6 +23,8 @@ import time
 from typing import Any
 
 from cooker import db
+from cooker import llm as llm_mod
+from cooker import runner as runner_mod
 from cooker.config import Config
 from cooker.detect import IDLE, Detector
 from cooker.scheduler import Scheduler
@@ -38,8 +40,18 @@ class Kitchen:
         self._owns_conn = conn is None
         self.clock = time.time
         self.detector = Detector(cfg, self.conn, clock=self.clock)
+        # The GPU client exists only when we are actually live. In dry-run there
+        # is no LLM object at all, which is the strongest guarantee the code can
+        # give: there is nothing here holding a connection to omlx to accidentally
+        # use. M3 is the first milestone where that object is allowed to exist.
+        self.llm: llm_mod.LLM | None = None
+        self.runner: runner_mod.StageRunner | None = None
+        if not dry_run:
+            self.llm = llm_mod.LLM(cfg, emit=self._emit)
+            self.runner = runner_mod.StageRunner(cfg, self.conn, self.llm)
         self.scheduler = Scheduler(cfg, self.conn, self.detector, dry_run=dry_run,
-                                   clock=self.clock)
+                                   clock=self.clock,
+                                   stage_runner=self.runner if self.runner else None)
         self.stop = asyncio.Event()
         self.started_at = self.clock()
         self.states: dict[str, float] = {}
@@ -47,6 +59,11 @@ class Kitchen:
         self._prev_ts: float | None = None
         self._prev_key: tuple[str, bool] | None = None
         self.timers: list[asyncio.Task] = []
+
+    def _emit(self, type_: str, message: str,
+              data: dict[str, Any] | None = None) -> None:
+        """The callback shape llm.py takes, bound to our connection."""
+        db.emit(self.conn, type_, message=message, data=data or {})
 
     # --- the loop ---------------------------------------------------------
 
@@ -104,6 +121,9 @@ class Kitchen:
         stopper = getattr(self.detector.sampler, "stop", None)
         if callable(stopper):
             stopper()
+        if self.llm is not None:
+            with contextlib.suppress(Exception):
+                await self.llm.aclose()
         self.stop.set()
         db.emit(self.conn, "daemon.stop",
                 message=f"stopping after {self.clock() - self.started_at:.0f}s",

@@ -236,6 +236,43 @@ is its own answer: if nettop is not running, the reason is `blind: no throughput
 data, cannot tell 0 from unknown` and the state is `ACTIVE_USER` — finish what is in
 flight, start nothing — rather than either guess.
 
+## 12. omlx will tell you the truth if you ask it (bench #9)
+
+M3's first live run filed a stage as `prompt_tokens: 0, completion_tokens: 1` for
+a 1,016-character answer, with `ttft_ms: 5`. Every one of those numbers was a
+lie, and none of them were crashes — which is what makes them dangerous in a
+budget column.
+
+Three separate causes, three fixes:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `ttft_ms: 5` | stamped at the first **byte**; omlx flushes headers instantly | stamp at the first **token**, then prefer the server's own figure |
+| `completion_tokens: 1` | fallback estimate ran once, on chunk one, then `if not tokens` was false forever | recompute from accumulated text every chunk until the server reports |
+| `prompt_tokens: 0` | **the server was never asked** | send `stream_options: {"include_usage": true}` |
+
+That third one is the discovery. Asked, omlx returns more than the OpenAI schema:
+
+```
+prompt_tokens: 179, completion_tokens: 202, time_to_first_token: 0.32,
+prompt_tokens_per_second: 550.9, generation_tokens_per_second: 133.1
+```
+
+The decode rate corroborates §B (19–30 tok/s): those earlier runs were
+`enable_thinking: true`, so their 604-character *reasoning* blocks were the
+output — at 133 tok/s undiscriminating, which is the number that makes thinking
+off for mechanical stages an obvious win rather than a hunch.
+
+Prefill at ~551 tok/s puts the 1,000-token ceiling at ~1.8 s, matching §E's 1.8×
+idle TTFT from a different direction.
+
+**Consequence for the code.** `llm.py` now sends `include_usage` on every request
+and labels every number it records: `usage: server` when omlx reported both halves,
+`server:prompt-only` / `server:completion-only` when it reported one, `estimated`
+when it reported neither. A zero is treated as "not reported" and never stored as
+cost, because a recorded zero reads as a fact and is indistinguishable from never
+having measured.
+
 ## Open question, deliberately deferred
 
 **Does a hard abort mid-prefill eventually free the accelerator sooner than the

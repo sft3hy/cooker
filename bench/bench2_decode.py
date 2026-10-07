@@ -12,7 +12,16 @@ life in DECODE, not prefill. We then:
   3. measure small-request TTFT immediately after
 If (3) == baseline, dropping the connection genuinely frees the accelerator.
 """
-import http.client, json, os, re, statistics, subprocess, threading, time, pathlib, uuid, sys
+import http.client
+import json
+import pathlib
+import re
+import statistics
+import subprocess
+import sys
+import threading
+import time
+import uuid
 
 HOST, PORT = "100.122.197.81", 8000
 

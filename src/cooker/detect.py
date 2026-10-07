@@ -303,7 +303,8 @@ class LiveSampler:
         self.port = int(cfg.get("detect.omlx_port", 8000))
         self.names = tuple(cfg.get("detect.omlx_proc_names", ["omlx", "omlx-server"]))
         self.oc_port = int(cfg.get("detect.opencode_port", 4096))
-        self.wal = Path(str(cfg.get("detect.opencode_wal", "~/.local/share/opencode/opencode.db-wal")))
+        self.wal = Path(str(cfg.get("detect.opencode_wal",
+                                     "~/.local/share/opencode/opencode.db-wal")))
         self.stats = Path(str(cfg.get("detect.llm_stats_file", "~/.omlx/stats.json")))
         self.fs_roots = [Path(str(p)) for p in cfg.get("detect.fs_roots", ["~/dev", "~/homelab"])]
         self.load_names = tuple(cfg.get("detect.load_proc_names", ["omlx", "opencode"]))

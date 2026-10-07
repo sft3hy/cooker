@@ -38,4 +38,18 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# A test asserting on a file it just wrote has no event loop to keep polite, and
+# wrapping every Path read in to_thread would obscure the assertion it is there
+# to make. The rule matters in src/, where a blocked loop is a missed preemption.
+"tests/*" = ["ASYNC240"]
+# The frozen M1/M2 probes: they answered their question (DISCOVERY.md §A–§E) and
+# their output is the record. Style-only violations (semicolons, `l` as a
+# variable, imports mid-file) sit in code nobody will extend, so linting them
+# buys a diff and nothing else. bench8 and any new bench stay linted.
+"bench/bench2_decode.py" = ["E501", "E702", "E741", "F841", "SIM115"]
+"bench/bench4_thinking.py" = ["E702", "E741", "SIM115"]
+"bench/bench5_prefill.py" = ["E702", "E741", "SIM115", "B023", "F841"]
+"bench/bench_disconnect.py" = ["E402", "E501", "E702", "E741", "F841", "SIM115"]
 ignore = ["E501"]

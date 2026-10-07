@@ -52,6 +52,30 @@ class Config:
             node = node[part]
         return node
 
+    def with_overrides(self, **dotted: Any) -> Config:
+        """A copy with specific keys replaced, for benches and tests that need a
+        three-second cooldown instead of sixty.
+
+        Deep-copied, so shortening a timeout cannot mutate the caller's config.
+        An override naming a key that does not exist is a refusal rather than an
+        addition: a typo in `infer_min_bps` would otherwise create a knob nothing
+        reads while the real one stayed at its default.
+        """
+        import copy
+
+        data = copy.deepcopy(self._data)
+        for key, value in dotted.items():
+            node: Any = data
+            parts = key.split(".")
+            for part in parts[:-1]:
+                if not isinstance(node, dict) or part not in node:
+                    raise ConfigError(f"override for unknown key: {key}")
+                node = node[part]
+            if not isinstance(node, dict) or parts[-1] not in node:
+                raise ConfigError(f"override for unknown key: {key}")
+            node[parts[-1]] = value
+        return Config(data, self.root)
+
     def __getitem__(self, key: str) -> Any:
         value = self.get(key)
         if isinstance(value, dict):

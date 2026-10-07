@@ -11,10 +11,19 @@ Stdlib only. Measures:
   D) server busy-ness sampled from a separate thread via /v1/models round trip
      as a cheap "is the box contended" proxy + omlx CPU% from ps.
 """
-import http.client, json, statistics, subprocess, threading, time, sys
+import http.client
+import json
+import statistics
+import subprocess
+import sys
+import threading
+import time
 
 HOST, PORT = "100.122.197.81", 8000
-import pathlib, os, re
+import pathlib
+import re
+
+
 def _load_key():
     for rel in ("dev/autoresearch-service/.env", "dev/signal-summarizer/.env"):
         p = pathlib.Path.home() / rel

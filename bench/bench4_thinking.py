@@ -7,7 +7,11 @@ and finished with finish_reason=length -> empty answer. Cooker must know:
   - how big a max_tokens we need so artifacts are never empty
   - real TTFT (first non-keepalive delta) per variant
 """
-import http.client, json, re, time, pathlib, statistics
+import http.client
+import json
+import pathlib
+import re
+import time
 
 HOST, PORT, MODEL = "100.122.197.81", 8000, "Qwen3.8-Flash-Next-oQ4e-mtp"
 KEY = re.search(r"AR_LLM_API_KEY=(.+)",

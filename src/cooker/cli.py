@@ -416,9 +416,13 @@ def cmd_watch(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
-    """Detector + scheduler. Dry-run unless `--live`, and `--live` still has
-    nothing to run until M3 hands us a cancellable llm.py — by design, because
-    the traffic control has to be right before it ever touches the GPU."""
+    """Detector + scheduler. Dry-run unless `--live`.
+
+    In dry-run the Kitchen never constructs an LLM object at all, so there is
+    nothing in the process holding a connection to omlx to misuse. `--live`
+    constructs it, and prints the guardrails as it does so, because a run that
+    spends GPU time should say out loud what it is bounded by.
+    """
     async def go() -> int:
         conn = db.connect(cfg.db_path)
         db.migrate(conn)
@@ -433,8 +437,11 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
         if orphans:
             print(f"{INFO} recovered {orphans} orphaned stage(s)")
         if args.live:
-            print(f"{WARN} --live with no stage runner: stages will be claimed and"
-                  f" requeued. llm.py lands in M3.")
+            assert kitchen.llm is not None and kitchen.runner is not None
+            print(f"  {INFO} spending GPU: model={kitchen.llm.model} "
+                  f"prefill<= {kitchen.llm.ceiling}tok "
+                  f"max_tokens>={kitchen.llm.floor} "
+                  f"endpoint={kitchen.llm.resolver.base or 'resolving…'}")
         print("-" * 76)
         summary = await kitchen.run(seconds=args.seconds)
         print("-" * 76)
