@@ -891,4 +891,10 @@ parallel."` — conversation, not brief. Collection now sorts by timestamp and
 is correct against either order; the fake serves newest-first like the
 device, and the regression test asserts the newest turn wins. The poisoned
 candidate was cancelled out of the chain's record with the reason in its
-`error` column; a fresh order re-cooked the same topic.
+`error` column; a fresh order re-cooked the same topic. And the judge
+settled it independently: the poisoned plate had already reached evaluation
+and scored **2.8 REJECT — "the output is truncated mid-sentence, rendering
+the actionable advice incomplete"**. The judge never saw the bug report; it
+read the plate and refused to serve it. That is the argument for why the
+judge sits at the end of every chain no matter whose hands cooked — when
+the kitchen itself is wrong, the last gate is still honest.
