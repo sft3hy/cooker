@@ -715,8 +715,16 @@ class Detector:
             ev.append(f"hid {sig.hid_idle_s:.0f}s")
         if sig.oc_wal_age_s is not None and sig.oc_wal_age_s < self.wal_seconds:
             ev.append(f"opencode.db-wal {sig.oc_wal_age_s:.0f}s")
-        if sig.oc_clients:
-            ev.append(f"opencode socket {', '.join(str(c) for c in sig.oc_clients)}")
+            # A connected :4096 client counts only while the WAL is also fresh.
+            # Landmine #16 says sockets are not inference on :8000, and today it
+            # learned the same about :4096: a resident subscriber — a dashboard
+            # poller, a parked TUI, this daemon's own sibling — holds one open
+            # for hours while nobody types, and unconditonal socket evidence
+            # made ACTIVE_USER permanent no matter how quiet the box was. The
+            # WAL is the event; the socket is only the relationship that lets
+            # it happen.
+            if sig.oc_clients:
+                ev.append(f"opencode socket {', '.join(str(c) for c in sig.oc_clients)}")
         if sig.fs_age_s is not None and sig.fs_age_s < self.fs_seconds:
             ev.append(f"fs {sig.fs_age_s:.0f}s")
         return ev

@@ -696,6 +696,32 @@ async def test_a_typing_human_outranks_monitor_traffic() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_resident_subscriber_is_not_a_user() -> None:
+    """Landmine #16, the sequel, on :4096.
+
+    A connected opencode client with a stale WAL is a parked TUI or a dashboard
+    subscriber, not someone typing. This exact evidence — `opencode socket
+    OrbStack Helper(18634)` alone — kept ACTIVE_USER permanent on 2026-10-07
+    while the box was empty, because a relationship was being read as an event.
+    """
+    c, clk, sc = cfg(), Clock(), Scripted()
+    d = make(c, None, sc, clk)
+    sig = up(Signals(ts=clk.t, oc_wal_age_s=45.0,
+                    oc_clients=(Peer(18634, "OrbStack Helper"),)))
+    sc.push(sig)
+    state = await d.tick()
+    assert state.state == IDLE, f"a silent subscriber must not wall the kitchen: {state.reason}"
+
+    clk.advance(1)
+    sig2 = up(Signals(ts=clk.t, oc_wal_age_s=3.0,
+                      oc_clients=(Peer(18634, "OrbStack Helper"),)))
+    sc.push(sig2)
+    state = await d.tick()
+    assert state.state == ACTIVE_USER, "the same socket WITH a fresh WAL is a live session"
+    assert "opencode socket" in state.reason, state.reason
+
+
+@pytest.mark.asyncio
 async def test_stale_ledger_falls_back_to_the_old_byte_judge() -> None:
     """When we cannot ask the server, bytes are the trigger again — unchanged,
     safety-first. This test is the fallback, verbatim: same bytes as the

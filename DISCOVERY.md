@@ -672,3 +672,84 @@ real client of the GPU (agents count as someone, commandment 1), so the kitchen
 stands down correctly. The dashboard metronome (~1,720 B/s, §17) remains the
 structural blocker; nothing was relaxed to get the honest reading: floor 256,
 `claim_quiet: 4.0`, threshold 3.5 all untouched.
+
+## §20 The ledger is the judge — bytes were demoted (bench15, live proof, 2026-10-07)
+
+The metronome did not stop; it multiplied. At 11:xx the Traefik access log said:
+
+    242 GET /admin/api/stats  in 120 s  ≈ 2/s, response 6,389 B each,
+    client 192.168.117.1 (the host itself, via the published port — a browser
+    tab on omlx.home.arpa's admin console), router omlx@file → 100.122.197.81:8000
+
+nettop saw the same thing as the §17 dashboard poll (raw :8000, ~6.6 KB every
+5 s, still there) *plus* a steady 12,557 B/s hairpin flow at :57352 — 2 × 6.4
+KB per second, forever. That is the `7–9 k B/s` the UI had been honestly
+reporting as ACTIVE_INFER. §17's one-line cadence fix was overtaken inside a
+day without anyone deciding anything: **cadence drifts, monitors multiply, and
+a bytes-shaped gate is structurally indefensible against them.** nettop cannot
+see URLs (§17), and shape cannot separate them (bench14). The proxy sees URLs
+and logs them; the server *is* the authority on what a request was.
+
+The server's admin ledger, measured (`bench/bench15_ledger_vs_wire.py`):
+
+    phase A, 32 s of /admin/api/stats polling at 1 Hz *while the metronome ran*:
+        total_active_requests 0 · waiting 0 · generating/prefilling []
+        idle_seconds          6.0 → 37.8 monotonic
+        total_requests        1426 → 1426      ← the metronome moves nothing
+    phase B, one real completion (8 tok, 0.26 s, ttft 0.19 s):
+        total_requests        1426 → 1427 · idle_seconds reset to 1.1
+
+The ledger ignores monitors and remembers inference. The live counters can miss
+a sub-second request even at 10 Hz — `idle_seconds` catches those, and it is a
+per-model clock measured by the party that does the work.
+
+**What this decides.** `cooker/ledger.py`: one small GET per second (§8's
+endpoint ladder, https first; ~6 KB; 5–8 ms of the server's event loop per the
+access log's own durations). When the ledger is up, it *is* the judge:
+ACTIVE_INFER iff `active − own > 0` or `waiting > 0`, or bytes with
+`idle_seconds` freshly reset (the request the counters missed, margin 5 s);
+bytes above the floor that the ledger will not call a generation are
+**monitor traffic** and can no longer close the gate, at any cadence, from any
+process, forever. When the ledger is blind, the §16 byte regime runs
+*unchanged* — fail-closed, never fall-open. Gates untouched: `claim_quiet 4`,
+`idle_confirm 60`, floor 256, threshold 3.5. Polling the ledger pollutes the
+wire with… a poll. When bytes are no longer the judge, self-pollution is a
+question, not an event — that dissolves §17's objection to itself.
+
+Two further walls fell in the same session, reported honestly as collateral:
+
+1. **`:4096` sockets were user evidence, unconditionally.** The landmine #16
+   lesson (sockets are not *inference*) had not been applied to the
+   user-evidence layer: a connected opencode client — a resident subscriber, a
+   parked TUI, the dashboard's poller — made ACTIVE_USER permanent
+   (`opencode.socket …` in every blocker) while the box was empty. Now the
+   socket counts only while the WAL is also fresh: a relationship with no
+   events is presence, not busy.
+2. **The daemon had never survived its own stage.** The event table's entire
+   history held one `sched.start`, and it said "would run" (dry-run). Under
+   bytes-judge, our own streamed completion moves omlx's counters → ACTIVE_INFER
+   → `_preempt_all` cancels our slot. The ledger closes the loop:
+   `own` (the LLM client's inflight count, threaded through Kitchen) is
+   subtracted from `active`; bytes + fresh idle + `own > 0` is "cooking: ours".
+
+**Live proof.** With the metronome still hammering: first production
+`sched.ready` and first real plate the daemon ever made —
+
+    11:24:09 IDLE  ready to cook → start: slot0:brainstorm.generate
+    11:24:18 ACTIVE_INFER model active 3.7s ago (ledger) → plate: slot0:generate
+
+— held under a bounded bench window (11:20–11:27, `user_idle_seconds: 4`,
+`opencode_wal_seconds: 4`, `fs_activity_seconds: 0`, generators brainstorm-only,
+all reverted same day, git-visible): the permanent evidence walls were working
+*as designed* — my own session kept the WAL fresh on every persisted token, and
+a human at the machine keeps `hid < 120`. Interactive always wins; tonight it
+cooks when the room actually empties. Follow-up owed: tomorrow morning, confirm
+`status` shows a research chain seeded, run and judged unattended.
+
+Operational notes: admin login is `POST /admin/api/login {"api_key":…}` →
+**HttpOnly cookie in Set-Cookie** (the body is just `{"success":true}` — parsing
+a `session_id` out of it KeyError'd once); `AR_OMLX_ADMIN_KEY` does *not*
+authenticate `/v1` (401), and the admin session does not either — two auth
+domains, two keys, both in the autoresearch `.env`; the key is never committed
+and never in the plist (the daemon reads the same file ladder as the inference
+key).
