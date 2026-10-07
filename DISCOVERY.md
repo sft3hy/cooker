@@ -875,5 +875,20 @@ other key on this box.
 
 Live proof, same sitting: order taken 13:52, gate opened on the first 4-second
 gap (`start: slot0:deep-dive.delegate`), session created in the delegation
-workspace with the `.env` ladder password, permissions auto-tended by policy —
-numbers below.
+workspace, and then the honest part — two ledger preemptions at
+`omlx serving 2 request(s)`, where `own` subtracted exactly the one session
+Cooker minted and the second request was this report being written: the
+kitchen yielded its own delegation to the conversation, recovered it on the
+quiet, and completed it: **SUCCEEDED, 29,607 tokens in, 2,711 out, 157.4s
+wall across two yields, `plate: slot0:delegate`**.
+
+And the bug the live run caught that 269 tests did not: **`GET /message`
+answers newest-first** (the idle sentinel rode at the head of the list in
+the very first probe — the probe was read right, the collector written
+wrong). Taking the last list element collected the *oldest* assistant
+utterance, so the first plate was a 250-byte `"I'll research this topic in
+parallel."` — conversation, not brief. Collection now sorts by timestamp and
+is correct against either order; the fake serves newest-first like the
+device, and the regression test asserts the newest turn wins. The poisoned
+candidate was cancelled out of the chain's record with the reason in its
+`error` column; a fresh order re-cooked the same topic.
