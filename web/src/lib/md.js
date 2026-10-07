@@ -18,9 +18,14 @@ function inline(s) {
   let out = s.replace(/`([^`]+)`/g, (_, c) => `<code>${c}</code>`);
   out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
   out = out.replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>');
-  out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, text, hrefRaw) => {
+  // one level of nested parens inside the URL, exactly as markdown's
+  // simplest form allows — so `evil(1)` inside a refused link dies whole,
+  // brackets and all: a refusal that leaves `)` behind is raw markdown
+  // wearing a trenchcoat, and this file has one rule.
+  out = out.replace(/\[((?:[^\[\]]|\[[^\]]*\])*)\]\(((?:[^()\s]|\([^()\s]*\))*)\)/g,
+                   (m, text, hrefRaw) => {
     const href = hrefRaw.replace(/&quot;/g, '"');
-    if (!/^https?:\/\//i.test(href)) return text; // refuse the rest outright
+    if (!/^https?:\/\//i.test(href)) return text; // refused outright, whole
     return `<a href="${esc(href)}" rel="noopener noreferrer" target="_blank">${text}</a>`;
   });
   return out;
@@ -39,7 +44,14 @@ export function renderMarkdown(src) {
   const flushQuote = () => { if (quote.length) { out.push(`<blockquote>${inline(quote.join(' '))}</blockquote>`); quote = []; } };
   const flushTable = () => {
     if (!table) return;
-    const head = table[0], body = table.slice(table.length > 1 && /^[\s|:-]+$/.test(table[1]) ? 2 : 1);
+    // rows are arrays of cells by now — the separator row is the row whose
+    // EVERY cell is dashes-and-colons, not a string test against an array
+    // (a `[array].test` stringifies with commas and matches nothing, which
+    // is how `|---|---|` marched straight into the tbody in review).
+    const isSep = (row) => Array.isArray(row) && row.length > 0 &&
+                           row.every((c) => /^:?-{1,}:?$/.test(c));
+    const head = table[0];
+    const body = table.slice(isSep(table[1]) ? 2 : 1);
     let h = `<table><thead><tr>` + head.map(c => `<th>${inline(c)}</th>`).join('') + '</tr></thead><tbody>';
     for (const row of body) h += '<tr>' + row.map(c => `<td>${inline(c)}</td>`).join('') + '</tr>';
     out.push(h + '</tbody></table>'); table = null;
