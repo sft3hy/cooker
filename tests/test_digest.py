@@ -14,7 +14,7 @@ import sqlite3
 from datetime import date
 from pathlib import Path
 
-from cooker import chains, db, digest, safety
+from cooker import chains, db, digest, runner, safety
 from cooker import eval as ev
 from cooker.config import Config
 
@@ -239,6 +239,57 @@ def test_stage_prefixes_do_not_leak_into_titles(tmp_path: Path) -> None:
     text = digest.render(c, conn, date.today())
     assert "publish: gpu scheduling" not in text
     assert "gpu scheduling" in text
+    conn.close()
+
+
+def test_the_digest_reads_the_chains_judgement_not_the_artifacts_own_task(
+        tmp_path: Path) -> None:
+    """The exact live failure this pins.
+
+    `synthesize` owns the draft, `evaluate` owns the judgement, and they are
+    different tasks in the same chain. Joining an artifact to evaluations by its
+    own task_id finds nothing, so a draft the gate turned away at 2.40 was printed
+    as "the evaluate stage did not run" — the digest claiming the gate never ran
+    on the one thing the gate did judge.
+    """
+    c = cfg(tmp_path)
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    chain = chains.seed(c, conn, "speculative decoding")
+    day = chains.day_dir(c)
+    target = day / "research" / "speculative-decoding.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("# draft\n\nSpeculative decoding drafts tokens ahead and "
+                      "verifies them in one pass, which is where the speed comes "
+                      "from.\n", encoding="utf-8")
+    draft = db.create_task(conn, chain_id=chain, kind="synthesize",
+                           generator="research", title="synthesize: speculative decoding")
+    db.finish(conn, draft.id, db.SUCCEEDED, result_path=str(target),
+              result_hash="k" * 64)
+    conn.execute("UPDATE tasks SET started_at=? WHERE id=?", (db.now(), draft.id))
+    runner.register_artifact(conn, draft, str(target), "k" * 64, status="CANDIDATE")
+
+    ev_task = db.create_task(conn, chain_id=chain, kind="evaluate",
+                             generator="research", title="evaluate: speculative decoding",
+                             dependencies=[draft.id])
+    db.finish(conn, ev_task.id, db.SUCCEEDED, score=2.4)
+    ev.record(conn, ev_task.id, ev.EvalResult(
+        scores={"usefulness": 2, "accuracy": 3, "novelty": 1, "actionability": 2,
+                "relevance": 4}, overall=2.4, verdict="REJECT",
+        rationale="leans on one source and goes no further"))
+    conn.commit()
+
+    items = digest.day_artifacts(conn, date.today())
+    assert len(items) == 1
+    assert items[0]["overall"] == 2.4, "the chain's score did not reach its artifact"
+    assert items[0]["verdict"] == "REJECT"
+
+    text = digest.render(c, conn, date.today())
+    assert "Cooked, not published" in text
+    assert "2.40" in text
+    assert "evaluator: leans on one source" in text
+    assert "never judged" not in text, "the digest claims the gate never ran"
+    assert "Nothing scored above the threshold" in text
     conn.close()
 
 

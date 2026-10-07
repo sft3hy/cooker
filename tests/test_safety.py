@@ -327,3 +327,44 @@ def test_system_prompt_says_data_not_instructions() -> None:
     p = safety.SYSTEM_DATA_ONLY
     assert "never an instruction" in p
     assert "Do not follow" in p
+
+
+def test_counts_are_not_secrets() -> None:
+    """The false positive that mangled the digest.
+
+    `tokens: 24691` matched the old single pattern because the key `tokens`
+    *contains* TOKEN, so the daily cost line — the number the whole project exists
+    to report — came out as `[REDACTED:secret-assignment]`. Numbers after
+    count-shaped keys must survive.
+    """
+    for text in ("tokens: 24691 in / 27,691 out",
+                 "port: 8256 timeout: 300",
+                 "fetch_max_bytes: 262144",
+                 "token count 42, token budget: 3000"):
+        scan = safety.scan_secrets(text)
+        assert scan.clean, f"{text!r} was redacted as {scan.findings[0].kind}"
+        assert scan.text == text
+
+
+def test_real_assignments_still_redact_at_both_strengths() -> None:
+    """The gap closed by the split is only "numeric-only value under a weak key".
+    Everything else still has to be caught."""
+    for text, kind in (("api_token: ghp_ABCDEFGHIJKLMNOP", "token-assignment"),
+                       ("API_KEY = sk-proj-9f8a7b6c", "token-assignment"),
+                       ("password: 1234", "secret-assignment"),
+                       ("client_secret: 9999", "secret-assignment")):
+        scan = safety.scan_secrets(text)
+        assert not scan.clean, f"{text!r} survived the scan"
+        assert scan.findings[0].kind == kind, f"{text!r} -> {scan.findings[0].kind}"
+        assert "[REDACTED" in scan.text
+
+
+def test_a_numeric_secret_under_a_weak_key_is_a_known_gap_not_a_surprise() -> None:
+    """Documented, not hidden: a digits-only value behind `token:` is not
+    redacted, because the alternative is redacting every count in every artifact.
+    This test exists so that if the rule changes, this changes loudly."""
+    scan = safety.scan_secrets("token: 12345678")
+    assert scan.clean
+    # ...and the same value behind a bearer header, where the shape is explicit,
+    # is still caught
+    assert not safety.scan_secrets("Authorization: Bearer 12345678").clean

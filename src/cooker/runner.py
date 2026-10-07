@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -38,7 +38,15 @@ from cooker import chains, db, safety
 from cooker import eval as eval_mod
 from cooker import search as search_mod
 from cooker.config import Config
-from cooker.llm import LLM, Completion, EndpointGone, PrefillOver, Request
+from cooker.llm import (
+    CHARS_PER_TOKEN,
+    LLM,
+    Completion,
+    EndpointGone,
+    PrefillOver,
+    Request,
+    estimate_tokens,
+)
 
 # Kinds that must never reach the accelerator. `plan` is not in here: deciding
 # what to search for is exactly the kind of thing the box is for, and it costs a
@@ -217,20 +225,52 @@ class StageRunner:
                     return text
         return ""
 
+    def _excerpt_budget(self, topic: str, sources: list[str]) -> tuple[int, int]:
+        """How many characters of the draft the evaluator may read, and the
+        ceiling it has to fit inside.
+
+        Computed, not configured-and-hoped. A budget written down as "2400" is a
+        guess about tokenisation, and the guess was wrong: 2,400 characters of
+        draft plus this system prompt lands at ~1,200 tokens against a ceiling of
+        1,000, so `evaluate` refused its own stage and the chain stalled at the
+        gate. Asking the same estimator the ceiling is enforced with gives a number
+        that cannot drift when the system prompt or the source list changes.
+        """
+        ceiling = int(self.cfg.get("inference.max_prefill_tokens_per_request",
+                                    1000))
+        base = eval_mod.eval_prompt(topic, "", sources, max_chars=0)
+        overhead = (estimate_tokens(eval_mod.EVAL_SYSTEM)
+                    + estimate_tokens(base))
+        # 48 tokens of slack, the same allowance `fit()` reserves for its own
+        # "context trimmed" note, which is longer than this one but same order.
+        room = int((ceiling - overhead - 48) * CHARS_PER_TOKEN)
+        cap = int(self.cfg.get("research.evaluate_excerpt_chars", 2400))
+        return max(0, min(cap, room)), ceiling
+
     def _eval_request(self, task: db.Task) -> Request:
         draft = self._draft_text(task)
         sources = [str(s.get("url")) for s in
                   (task.payload.get("sources") or []) if s.get("url")]
         budgets = self.cfg.get("inference.stage_max_tokens", {}) or {}
+        topic = str(task.payload.get("topic") or task.title)
         if not draft.strip():
             # Nothing to score. An evaluator that invents a draft to score is how
             # a nonexistent artifact gets a 4.8 in the database.
             raise safety.PathRefused("evaluate asked with no draft to read")
-        return Request(system=eval_mod.EVAL_SYSTEM,
-                       user=eval_mod.eval_prompt(
-                           str(task.payload.get("topic") or task.title), draft,
-                           sources),
-                       thinking=False, kind=task.kind, stage=task.kind,
+        excerpt, ceiling = self._excerpt_budget(topic, sources)
+        if excerpt <= 0:
+            raise PrefillOver(
+                "the evaluator's own instruction leaves no room for the draft under "
+                f"the ceiling of {ceiling} tokens; shorten EVAL_SYSTEM or raise "
+                "nothing — raise the ceiling only against a measurement")
+        text = eval_mod.eval_prompt(topic, draft, sources, max_chars=excerpt)
+        ask = estimate_tokens(eval_mod.EVAL_SYSTEM) + estimate_tokens(text)
+        if ask > ceiling:
+            # Arithmetic, not advice: refuse here rather than let `fit()` discover
+            # there is no fence to trim and fail a stage that was ours to size.
+            raise PrefillOver(f"evaluation prompt is ~{ask} tokens > {ceiling}")
+        return Request(system=eval_mod.EVAL_SYSTEM, user=text, thinking=False,
+                       kind=task.kind, stage=task.kind,
                        max_tokens=int(budgets.get("evaluate", 320)))
 
     # --- dispatch --------------------------------------------------------
@@ -436,7 +476,7 @@ class StageRunner:
         db.finish(self.conn, task.id, db.SUCCEEDED, result_path=str(target),
                   result_hash=digest,
                   duration_ms=(time.perf_counter() - t0) * 1000)
-        register_artifact(self.conn, task, str(target), digest, status="PUBLISHED")
+        promote_candidate(self.conn, task, str(target), digest, score)
         eval_mod.mark_result_seen(self.conn, digest, task.id)
         self.emit("runner.published",
                   f"{task.generator}: {target.name} "
@@ -446,6 +486,34 @@ class StageRunner:
         return Outcome(task.id, db.SUCCEEDED, path=str(target))
 
     # --- the thinking stages ----------------------------------------------
+
+    async def _stream_with_retry(self, req: Request, task: db.Task) -> Completion:
+        """Ask once. If the model thought itself out of an answer, ask again with
+        room for one.
+
+        This model streams its reasoning before its reply, so a tight output budget
+        buys `finish_reason=length` with nothing but thinking behind it. Measured
+        live today: `critique` spent its 900 tokens on 4,364 characters of reasoning
+        and produced no content, and the stage failed. Widening the answer budget is
+        not the concession it looks like — the M3 finding is that decode is
+        preemptible and fair while it is the *prefill* ceiling that protects the
+        interactive user — but it is still a concession, so it happens once, capped,
+        and is recorded as an event rather than folded into the default silently.
+        """
+        comp = await self.llm.stream(req)
+        if comp.usable or comp.finish_reason != "length":
+            return comp
+        ceiling = int(self.cfg.get("inference.length_retry_max_tokens", 3000))
+        if req.max_tokens >= ceiling:
+            return comp
+        next_budget = min(ceiling, int(req.max_tokens * 2))
+        self.emit("runner.length_retry",
+                  f"{task.kind} used all {req.max_tokens} tokens on "
+                  f"{len(comp.reasoning)}c of reasoning with no answer; retrying at "
+                  f"{next_budget}",
+                  {"task_id": task.id, "stage": task.kind, "from": req.max_tokens,
+                   "to": next_budget, "reasoning_chars": len(comp.reasoning)})
+        return await self.llm.stream(replace(req, max_tokens=next_budget))
 
     async def _thinking(self, task: db.Task) -> Outcome:
         t0 = time.perf_counter()
@@ -464,7 +532,7 @@ class StageRunner:
         # codebase to discover a bug, because it hides behind the first one.
         comp: Completion | None = None
         try:
-            comp = await self.llm.stream(req)
+            comp = await self._stream_with_retry(req, task)
         except asyncio.CancelledError:
             # Record, then propagate. Without the accounting the events table
             # shows a stage that vanished and a GPU busy for nine seconds with
@@ -529,7 +597,15 @@ class StageRunner:
                   output_tokens=comp.completion_tokens,
                   ttft_ms=(comp.ttft_s or 0) * 1000,
                   duration_ms=comp.elapsed_s * 1000)
-        register_artifact(self.conn, task, str(path), digest, status="CANDIDATE")
+        # An artifact is an output, not a stage. Every thinking stage registered a
+        # row here, which turned `artifacts` into a scratch index — plan, extract
+        # and critique files listed alongside real outputs, so the digest reported
+        # "21 artifacts today" when today was four stages of one chain plus a
+        # draft. The draft is the output-in-waiting, the thing publish promotes,
+        # and the only intermediate worth a row. The others are still kept and still
+        # reachable through `tasks.result_path`; kept and listed are different words.
+        if task.kind in chains.DRAFT_KINDS:
+            register_artifact(self.conn, task, str(path), digest, status=db.CANDIDATE)
         self.emit("runner.stage",
                   f"{task.generator}.{task.kind} -> {path.name} "
                   f"({len(comp.text)} chars, {comp.completion_tokens} tok, "
@@ -551,6 +627,15 @@ class StageRunner:
         """
         threshold = float(self.cfg.get("quality.publish_threshold", 3.5))
         ev = eval_mod.parse_eval(comp.text, threshold=threshold)
+        # How much of the draft the judge actually read, recorded alongside the
+        # score it produced from that text.
+        draft = self._draft_text(task)
+        sources = [str(s.get("url")) for s in
+                   (task.payload.get("sources") or []) if s.get("url")]
+        excerpt, _ceiling = self._excerpt_budget(
+            str(task.payload.get("topic") or task.title), sources)
+        ev.draft_chars = len(draft)
+        ev.evaluated_chars = min(len(draft), excerpt)
         eval_mod.record(self.conn, task.id, ev)
         db.merge_payload(self.conn, task.id, {"score": ev.overall,
                                               "verdict": ev.verdict,
@@ -642,8 +727,37 @@ def slug_dirname(task: db.Task) -> str:
     return f"{chains.slug(task.payload.get('topic') or task.title)}"
 
 
+def promote_candidate(conn: sqlite3.Connection, task: db.Task, path: str,
+                      digest: str, score: float | None) -> None:
+    """Turn the chain's draft row into the published row instead of adding another.
+
+    The published file is the synthesize draft with its secrets redacted, so it is
+    the same artifact at a later stage of being real, not a new artifact. Two rows
+    for one output means every reader has to deduplicate by hash before it can
+    count anything, which is how a four-stage chain started reporting a four-item
+    day. If there is no candidate — a hand-queued publish, or a chain that arrived
+    from an older binary — a row is created, because a published file that appears
+    nowhere is the same as work that never happened.
+    """
+    row = conn.execute(
+        "SELECT id FROM artifacts WHERE status=? AND task_id IN"
+        " (SELECT id FROM tasks WHERE chain_id=?) ORDER BY created_at DESC"
+        " LIMIT 1", (db.CANDIDATE, task.chain_id)).fetchone()
+    if row:
+        conn.execute("UPDATE artifacts SET status=?, path=?, hash=?"
+                     ", score=? WHERE id=?",
+                     (db.PUBLISHED, path, digest, score, row["id"]))
+    else:
+        conn.execute(
+            "INSERT INTO artifacts (id, task_id, generator, title, path, hash, score,"
+            " scores_json, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (db.new_id(), task.id, task.generator, task.title, path, digest, score,
+             None, db.PUBLISHED, db.now()))
+    conn.commit()
+
+
 def register_artifact(conn: sqlite3.Connection, task: db.Task, path: str,
-                      digest: str, *, status: str = "CANDIDATE") -> None:
+                      digest: str, *, status: str = db.CANDIDATE) -> None:
     """Record an artifact. `CANDIDATE` is what a thinking stage produces: it
     exists, it is readable, and nothing has judged it yet. `publish` promotes it.
     A stage that wrote a file and recorded nothing is an artifact that never

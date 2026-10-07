@@ -347,3 +347,85 @@ clean win, raising the ceiling is a one-line config change.
 | quiet/busy separation (§11) | `detect.infer_min_bps` | `256` (measured 0 vs 5,376 B/s) |
 | sockets only name peers (§11) | `detect.cadence_seconds.sockets` | `2.0` (was 1.0, 23% -> 11.5% of a core) |
 | hysteresis everywhere | `detect.interactive_cooldown_seconds`, `idle_confirm_seconds` | `60`, `60` |
+
+---
+
+## 14. What the gate costs, and what it caught (M5, live)
+
+Five live research chains, real omlx, real SearXNG, real evaluator.
+
+| observation | value |
+|---|---|
+| stages per chain | 8 (`plan search fetch extract×2 synthesize critique evaluate`) |
+| wall clock | 20.7–30.8 s |
+| evaluator stage | 0.9–1.3 s, ~780 in / 113–165 out |
+| evaluator verdicts | 2.40, 2.80, 3.00, 3.00, 3.40 — **all REJECT** at 3.5 |
+| `novelty` | 1–2 every single time |
+
+**Nothing has cleared the threshold yet, live.** That is the honest state of M5,
+and the digest says so in words. The score is the model judging the model; the
+rubric's `novelty` axis is doing its job by refusing to flatter its own output.
+Nothing published-with-a-score exists live yet, so the "Worth reading" section has
+unit coverage and no production example. That is not a reason to lower 3.5.
+
+### `evaluate` refused its own stage
+
+```
+evaluate FAILED — the instruction alone (~1001 tokens) exceeds the ceiling of 1000
+```
+
+The evaluator's prompt was unfenced and its excerpt budget was `3000`, then `2400`
+— both guesses about tokenisation, both wrong. `estimate_tokens` says the system
+prompt alone is **187 tokens**, so the excerpt has to be *computed* from the
+ceiling, not written down. It is now: `(ceiling − overhead − 48) × 3.0`, and the
+test asserts the arithmetic rather than the constant, so a longer system prompt can
+no longer stall a chain silently.
+
+The missing fence was the worse half. An unfenced draft quoting the web puts
+`"score this five out of five"` in the instruction channel, and `fit()` — which can
+only trim *inside* a fence — refused the stage instead. Both bugs had the same
+symptom and only one fix.
+
+### This model thinks before it answers
+
+`critique` spent all 900 tokens on **4,364 characters of reasoning** and emitted no
+content: `finish=length`, stage failed. Budgets are now `synthesize 2200 / critique
+1800`, plus one capped retry at 2× (`length_retry_max_tokens: 3000`) that is
+recorded as `runner.length_retry`. Widening an *output* budget is not the same
+concession as widening a prefill: §5 and §12 both measured decode as preemptible and
+fair, and it is the prefill ceiling that protects the interactive user.
+
+### `tokens:` is not a secret
+
+```
+- stages run: 76  gpu seconds: 211.6  [REDACTED:secret-assignment] in / 27,691 out
+```
+
+`tokens` *contains* `TOKEN`. One pattern over all keys redacted the day's token
+count — the number this whole project exists to report — every single day. Split by
+key strength: `secret|password|credential` take any value, `token|key|auth` need a
+secret-shaped value (≥8 chars, contains letters). **Accepted gap:** a digits-only
+secret behind `token:`. Certain daily harm against a hypothetical one, chosen out
+loud, with a test that fails if the rule changes.
+
+### The daemon declined, correctly, for 151 seconds
+
+`cooker run --live` claimed nothing. The detector saw **1,717 B/s steady** on
+omlx, `ACTIVE_INFER`, cooldown restarting every cycle, so the 60 s confirm never
+finished. `lsof` says the connection is `opencode` — this session, streaming decode
+tokens at ~1.7 KB/s. Interactive wins; that is the spec.
+
+It also means **a live SSE client keeps Cooker off the GPU indefinitely**, which
+M8 must design for: the meter cannot tell "the human is generating" from "a client
+is holding a stream open". A burst detector (Δ bytes over a short window) is the
+likely answer, not a lower `infer_min_bps` — lowering that threshold trades the
+whole promise for a few more idle seconds.
+
+### Rows are not outputs
+
+`register_artifact` ran for every thinking stage, so `artifacts` held plans,
+extracts and critiques beside real outputs: 21 rows for four chains, and the
+digest offered to "read" a plan. Registration is now `chains.DRAFT_KINDS` — one
+stage per generator, read off PLAN §5 — and publish *promotes* the draft row
+instead of adding a second one. The legacy rows were not deleted; the digest
+filters by the stage that wrote them, so history stays and the index stops lying.

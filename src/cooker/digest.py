@@ -36,45 +36,94 @@ def day_bounds(day: date) -> tuple[float, float]:
     return start, start + 86400.0
 
 
-def _score_for(conn: sqlite3.Connection, task_id: str) -> tuple[float, str, str]:
+def _score_for(conn: sqlite3.Connection, chain_id: str) -> dict[str, Any]:
+    """The chain's judgement, whichever stage's task the evaluation hung on.
+
+    The evaluator is its own stage, so its row is keyed to the `evaluate` task
+    while the artifact on disk belongs to `synthesize`. Joining an artifact straight
+    to its own task_id finds nothing for either of them and reports a scored,
+    rejected draft as *unjudged* — the worst error a digest can make, because it
+    claims the gate never ran on the one thing the gate did turn away.
+    """
+    empty = {"overall": 0.0, "verdict": "UNEVALUATED", "axes": "",
+             "partial": ""}
+    if not chain_id:
+        return empty
     row = conn.execute(
-        "SELECT overall, verdict, scores_json FROM evaluations WHERE task_id=?"
-        " ORDER BY created_at DESC LIMIT 1", (task_id,)).fetchone()
+        "SELECT e.overall, e.verdict, e.scores_json, e.draft_chars,"
+        " e.evaluated_chars FROM evaluations e JOIN tasks t ON t.id = e.task_id"
+        " WHERE t.chain_id=? ORDER BY e.created_at DESC LIMIT 1",
+        (chain_id,)).fetchone()
     if not row:
-        return 0.0, "UNEVALUATED", ""
+        return empty
     try:
         scores = json.loads(row["scores_json"] or "{}")
     except (json.JSONDecodeError, TypeError):
         scores = {}
     axes = " ".join(f"{k[:4]}={v}" for k, v in sorted(scores.items()))
-    return float(row["overall"]), str(row["verdict"]), axes
+    partial = ""
+    draft_chars = int(row["draft_chars"] or 0)
+    read_chars = int(row["evaluated_chars"] or 0)
+    if draft_chars and read_chars < draft_chars:
+        # The label is the whole point: without it a score read off two thirds of a
+        # document is indistinguishable from a score read off the document.
+        partial = (f"scored on the first {read_chars:,} of {draft_chars:,}"
+                   f" characters")
+    return {"overall": float(row["overall"]), "verdict": str(row["verdict"]),
+            "axes": axes, "partial": partial}
 
 
 def day_artifacts(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]]:
+    """Today's outputs, judged by their chain.
+
+    Two filters, both load-bearing.
+
+    *Only outputs.* Rows registered before the staging fix are plans, extracts and
+    critiques — scaffolding that exists and is kept on disk, but is not something
+    the digest should offer to read. What counts as an output is decided by the
+    stage that wrote it, never by its status: filtering on status would hide
+    rejected work, and rejected work staying visible is the rule.
+
+    *Scored by chain.* The judgement sits on the `evaluate` task; the file belongs
+    to `synthesize`. Joining the two directly reports a judged, rejected draft as
+    never judged.
+    """
     lo, hi = day_bounds(day)
+    # An artifact is an output if the stage that wrote it was a drafting stage or
+    # the publish stage. Filtering on status instead would hide rejected work, and
+    # rejected work staying visible is the whole rule: a rejection is information.
+    outputs = sorted(chains.DRAFT_KINDS | {"publish"})
+    ph = ",".join("?" * len(outputs))
     rows = conn.execute(
         "SELECT a.id, a.task_id, a.generator, a.title, a.path, a.hash, a.status,"
-        " t.score, t.input_tokens, t.output_tokens, t.duration_ms, t.ttft_ms"
+        " t.chain_id, t.kind, t.score, t.input_tokens, t.output_tokens,"
+        " t.duration_ms, t.ttft_ms"
         " FROM artifacts a LEFT JOIN tasks t ON t.id = a.task_id"
-        " WHERE a.created_at >= ? AND a.created_at < ?"
+        f" WHERE a.created_at >= ? AND a.created_at < ?"
+        f"   AND (t.kind IS NULL OR t.kind IN ({ph}))"
         " ORDER BY COALESCE(t.score, 0) DESC, a.created_at ASC",
-        (lo, hi)).fetchall()
+        (lo, hi, *outputs)).fetchall()
     out: list[dict[str, Any]] = []
     seen_hashes: set[str] = set()
     for r in rows:
-        # One row per artifact *content*: the chain writes a candidate at
-        # synthesize and promotes a copy at publish, and showing both makes a
-        # two-item day look like a four-item day.
+        # One row per artifact *content*: synthesize registers the draft and
+        # publish promotes that same row, but a chain from before that change holds
+        # two, and showing both makes a two-item day look like a four-item day.
         if r["hash"] in seen_hashes:
             continue
-        seen_hashes.add(r["hash"])
-        overall, verdict, axes = _score_for(conn, str(r["task_id"]))
-        out.append({**dict(r), "overall": overall, "verdict": verdict, "axes": axes})
+        seen_hashes.add(str(r["hash"]))
+        out.append({**dict(r), **_score_for(conn, str(r["chain_id"] or ""))})
+    return out
     return out
 
 
 def day_cost(conn: sqlite3.Connection, day: date) -> dict[str, Any]:
     lo, hi = day_bounds(day)
+    # COALESCE, not just started_at: a stage invoked without going through
+    # `claim_next` — a retry, a direct runner call, anything that did not take the
+    # write lock — has no started_at, and counting only claimed stages reported
+    # 490 tokens for a day that had genuinely spent several thousand. A stage that
+    # finished today ran today, however it got there.
     row = conn.execute(
         "SELECT COUNT(*) AS stages,"
         " COALESCE(SUM(input_tokens),0) AS tin,"
@@ -82,7 +131,8 @@ def day_cost(conn: sqlite3.Connection, day: date) -> dict[str, Any]:
         " COALESCE(SUM(duration_ms),0) AS ms,"
         " COALESCE(SUM(CASE WHEN preemptions>0 THEN 1 ELSE 0 END),0) AS pre,"
         " COALESCE(AVG(ttft_ms),0) AS ttft"
-        " FROM tasks WHERE started_at >= ? AND started_at < ?", (lo, hi)).fetchone()
+        " FROM tasks WHERE COALESCE(started_at, finished_at) >= ?"
+        " AND COALESCE(started_at, finished_at) < ?", (lo, hi)).fetchone()
     return {"stages": int(row["stages"] or 0), "input_tokens": int(row["tin"] or 0),
             "output_tokens": int(row["tout"] or 0),
             "gpu_seconds": round(float(row["ms"] or 0) / 1000.0, 1),
@@ -93,14 +143,21 @@ def day_cost(conn: sqlite3.Connection, day: date) -> dict[str, Any]:
 def _why_idle(conn: sqlite3.Connection) -> str:
     """The detector's own last word. A digest that says "idle" when the truth is
     "busy with you, and I am waiting 60 seconds out of politeness" is a digest
-    that tells you the wrong thing about your own machine."""
+    that tells you the wrong thing about your own machine.
+
+    The type list is the daemon's actual vocabulary, checked against the event
+    table rather than guessed at. Getting this wrong produces "no state recorded
+    yet" on a database holding a hundred and seventeen `bus.state` rows, which is
+    a confidently stated falsehood in the one line written for a human.
+    """
     row = conn.execute(
         "SELECT type, message FROM events WHERE type IN "
-        "('state.change','daemon.state','dry.would_seed','topics.exhausted',"
-        "'search.failed','chain.stalled') ORDER BY id DESC LIMIT 1").fetchone()
+        "('bus.state','sched.hold','dry.would_seed','topics.exhausted',"
+        "'search.failed','chain.stalled','chain.rejected','fetch.failed',"
+        "'chain.stub','daemon.stop') ORDER BY id DESC LIMIT 1").fetchone()
     if not row:
         return "no state recorded yet"
-    return f"{row['type']}: {str(row['message'])[:90]}"
+    return f"{row['type']}: {str(row['message'] or '')[:90]}"
 
 
 def render(cfg: Config, conn: sqlite3.Connection, day: date) -> str:
@@ -147,9 +204,11 @@ def render(cfg: Config, conn: sqlite3.Connection, day: date) -> str:
             lines.append(f"### {_title(str(i['title']))}")
             lines.append("")
             lines.append(f"- score **{i['overall']:.2f}** ({i['axes']})")
+            if i.get("partial"):
+                lines.append(f"- *{i['partial']}*")
             rel = _relative(cfg, str(i["path"]))
             lines.append(f"- read: `{rel}`")
-            rationale = _rationale(conn, str(i["task_id"]))
+            rationale = _rationale(conn, str(i["chain_id"] or ""))
             if rationale:
                 lines.append(f"- evaluator: {rationale}")
             excerpt = _excerpt(str(i["path"]), cfg)
@@ -162,8 +221,12 @@ def render(cfg: Config, conn: sqlite3.Connection, day: date) -> str:
     if rejected:
         lines += ["## Cooked, not published", ""]
         for i in rejected:
+            note = f" *({i['partial']})*" if i.get("partial") else ""
             lines.append(f"- **{i['overall']:.2f}** {_title(str(i['title']))[:80]} "
-                         f"({i['axes']}) — `{_relative(cfg, str(i['path']))}`")
+                         f"({i['axes']}){note} — `{_relative(cfg, str(i['path']))}`")
+            reason = _rationale(conn, str(i["chain_id"] or ""))
+            if reason:
+                lines.append(f"  - evaluator: {reason}")
             # Ratings on rejected work matter most: this is where you can say the
             # judge was wrong, and the EMA is the only thing that remembers.
             lines.append(f"  - disagree? `cooker rate "
@@ -237,15 +300,19 @@ def _relative(cfg: Config, path: str) -> str:
         return str(path)
 
 
-def _rationale(conn: sqlite3.Connection, task_id: str) -> str:
+def _rationale(conn: sqlite3.Connection, chain_id: str) -> str:
     """The evaluator's own sentence, read back from the row it wrote.
 
-    Read rather than re-derived: the digest has to cost nothing to look at, and a
+    Keyed by chain for the same reason `_score_for` is: the evaluator's row hangs
+    off the `evaluate` task, not the artifact's. Read rather than re-derived — a
     second inference call to find out why something scored 4.2 is the wrong shape
-    of expensive.
+    of expensive for a file you open every morning.
     """
-    row = conn.execute("SELECT rationale FROM evaluations WHERE task_id=?"
-                       " ORDER BY created_at DESC LIMIT 1", (task_id,)).fetchone()
+    if not chain_id:
+        return ""
+    row = conn.execute("SELECT e.rationale FROM evaluations e"
+                       " JOIN tasks t ON t.id = e.task_id WHERE t.chain_id=?"
+                       " ORDER BY e.created_at DESC LIMIT 1", (chain_id,)).fetchone()
     return str(row["rationale"])[:300] if row and row["rationale"] else ""
 
 

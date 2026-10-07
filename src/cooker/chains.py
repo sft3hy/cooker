@@ -55,8 +55,22 @@ FREE_KINDS = frozenset({"search", "fetch", "publish", "collect", "scan"})
 
 # Stages that think. Kept explicit so that adding a kind to the chain without
 # deciding this question is a visible gap rather than a silent GPU spend.
+# `consolidate` is the audit generator's synthesis step (PLAN §5) and needs the
+# model as much as `synthesize` does; leaving it out would have it refused as an
+# unknown kind, or worse, run as a free stage that quietly produced nothing.
 THINKING_KINDS = frozenset({"plan", "extract", "synthesize", "critique",
-                            "analyze", "write", "draft", "generate"})
+                            "analyze", "consolidate", "write", "draft", "generate"})
+
+# The stage whose text *is* the artifact — exactly one per generator, read off
+# PLAN §5: research `synthesize`, project-review `analyze`, homelab-audit
+# `consolidate`, brainstorm `generate`, creation and digest `write`. `draft` is
+# the kind the pre-M5 queue used and is still what `cooker add` produces.
+# Everything else — plans, extracts, critiques — is scaffolding: kept on disk and
+# reachable through `tasks.result_path`, but not listed as an output. Registering
+# every stage's file turned `artifacts` into a scratch index and made the digest
+# report twenty-one items for four chains' worth of stages.
+DRAFT_KINDS = frozenset({"synthesize", "analyze", "consolidate", "generate",
+                         "write", "draft"})
 
 
 def slug(text: str, *, limit: int = 48) -> str:

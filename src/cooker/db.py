@@ -33,6 +33,15 @@ PARKED = "PARKED"
 CANCELLED = "CANCELLED"
 REJECTED = "REJECTED"
 
+# Artifact lifecycle, deliberately separate from task status. A stage SUCCEEDs at
+# writing a draft while the *artifact* is still CANDIDATE — the stage did its job
+# and the work is still unjudged, and collapsing those two would make "the writer
+# failed" and "the judge said no" the same recorded fact. REJECTED is the one word
+# they share, and it means the same thing in both: this was looked at and turned
+# away, kept, never silently dropped.
+CANDIDATE = "CANDIDATE"
+PUBLISHED = "PUBLISHED"
+
 TASK_STATUSES = (QUEUED, RUNNING, PAUSED, SUCCEEDED, FAILED, PARKED, CANCELLED, REJECTED)
 # Statuses that mean "this dependency is done for good, unblock whoever waits on it".
 DEPS_SATISFIED = (SUCCEEDED,)
@@ -140,6 +149,12 @@ CREATE TABLE IF NOT EXISTS evaluations (
     overall     REAL NOT NULL,
     verdict     TEXT NOT NULL,
     rationale   TEXT,
+    -- how much of the work the judge actually read. A score computed on the
+    -- first 2,400 characters of a 4,200-character draft is a different fact from
+    -- a score computed on the draft, and the only way to tell them apart later is
+    -- to have said so at the time.
+    draft_chars INTEGER,
+    evaluated_chars INTEGER,
     created_at  REAL NOT NULL
 );
 
@@ -199,14 +214,19 @@ def connect(path: str | Path) -> sqlite3.Connection:
 _ADD_COLS: dict[str, tuple[tuple[str, str], ...]] = {
     # the evaluator's own sentence, so the digest can quote why something scored
     # what it scored without a second inference call to find out
-    "evaluations": (("rationale", "TEXT"),),
+    "evaluations": (("rationale", "TEXT"),
+                    ("draft_chars", "INTEGER"),
+                    ("evaluated_chars", "INTEGER")),
 }
 
 
 def _ensure_columns(conn: sqlite3.Connection) -> list[str]:
     added: list[str] = []
     for table, cols in _ADD_COLS.items():
-        have = {str(r["name"]) for r in
+        # positional, not by name: PRAGMA rows come back as tuples when the
+        # connection has no row_factory, and `migrate` should not depend on a
+        # detail of how the caller opened the database. Column name is index 1.
+        have = {str(r[1]) for r in
                 conn.execute(f"PRAGMA table_info({table})").fetchall()}
         for name, decl in cols:
             if name not in have:

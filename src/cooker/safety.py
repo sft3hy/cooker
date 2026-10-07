@@ -57,13 +57,32 @@ PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b")),
     ("bearer-header", re.compile(
         r"(?i)\b(authorization\s*[:=]\s*)bearer\s+[A-Za-z0-9\-._~+/]{8,}=*")),
-    # The lookahead matters: without it the placeholder produced by an earlier
-    # pattern (`token: [REDACTED:github-token]`) matches again and the second
-    # redaction replaces the *specific* kind with the vague one, which makes the
-    # audit trail lie about what was in the text.
+    # Two strengths of the same rule, because one rule got this wrong. The single
+    # pattern matched `tokens: 24691` — the key `tokens` *contains* TOKEN — and so
+    # the digest redacted the day's token count every single day, which is the
+    # exact information the whole project exists to report. Certain, daily harm
+    # against a hypothetical, so:
+    #
+    #   * unambiguous keys (secret, password, credential, private key) take any
+    #     value at all, digits included — `password: 1234` is a password;
+    #   * key/token/... require a secret-shaped value: eight or more characters
+    #     containing letters. A count is not a secret-shaped value.
+    #
+    # The accepted gap is a numeric-only secret assigned to a `token:` key. It is
+    # accepted knowingly, and structured secrets (GitHub, Slack, AWS, bearer
+    # headers) are covered by the specific patterns above regardless.
+    #
+    # The lookahead matters in both: without it the placeholder produced by an
+    # earlier pattern (`token: [REDACTED:github-token]`) matches again and the
+    # second redaction replaces the *specific* kind with the vague one, which makes
+    # the audit trail lie about what was in the text.
     ("secret-assignment", re.compile(
-        r"(?i)\b[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|ACCESS_KEY|"
-        r"PRIVATE_KEY|CREDENTIAL)[A-Z0-9_]*\s*[:=]\s*(?!\[REDACTED)[^\s\"']{4,}")),
+        r"(?i)\b[A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_?KEY)"
+        r"[A-Z0-9_]*\s*[:=]\s*(?!\[REDACTED)[^\s\"']{4,}")),
+    ("token-assignment", re.compile(
+        r"(?i)\b[A-Z0-9_]*(?:TOKEN|API_?KEY|ACCESS_?KEY|AUTH)"
+        r"[A-Z0-9_]*\s*[:=]\s*(?!\[REDACTED)"
+        r"(?=[^\s\"']*[A-Za-z])[A-Za-z0-9\-._~+/]{8,}=*")),
     ("private-key-path", re.compile(r"(?i)~?/?[\w.\-/]*/\.ssh/id_(?:rs|ed)25519")),
 )
 

@@ -113,10 +113,19 @@ inference:
   stage_max_tokens:
     plan: 400
     extract: 700
-    synthesize: 1400
-    critique: 900
+    # Raised from 1400/900 on 2026-10-07 after live chains: `synthesize` returned
+    # 2,185 completion tokens and still read as usable, while `critique` spent all
+    # 900 on 4,364 characters of reasoning and published *no content* — the model
+    # thinks before it answers, and a budget shorter than its thinking buys
+    # finish_reason=length with nothing to score. These are output budgets, so the
+    # interactive user is protected by the prefill ceiling above, not by these.
+    synthesize: 2200
+    critique: 1800
     evaluate: 320
     default: 512
+  # The retry budget for a stage that exhausted its own. Capped, because "retry
+  # with more" without a ceiling is how a stuck model spends the night.
+  length_retry_max_tokens: 3000
   thinking_off_stages:
     # `plan` picks search queries. That is selection, not reasoning, and a chain
     # of thought here costs tokens to produce four lines of text.
@@ -157,6 +166,11 @@ research:
   # How much of one page a single extract may read. Chosen against the 1000
   # token prefill ceiling, not against readability.
   source_context_chars: 2400
+  # How much of a draft the evaluator reads. Sized against the prefill ceiling:
+  # system + ask + this must stay under `max_prefill_tokens_per_request`, because
+  # a prompt that arrives at 1,001 tokens against a ceiling of 1,000 does not get
+  # trimmed, it gets refused, and the chain stalls at the gate.
+  evaluate_excerpt_chars: 2400
 
 topics:
   file: topics.md

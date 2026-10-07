@@ -626,6 +626,102 @@ async def test_publish_refuses_work_that_was_never_judged(tmp_path: Path) -> Non
     conn.close()
 
 
+def test_promote_reuses_the_draft_row_instead_of_adding_one(
+        tmp_path: Path) -> None:
+    """One output, one row.
+
+    Synthesize registers the draft; publish redacts it and writes the final file.
+    Inserting a second row means every reader has to deduplicate by hash before it
+    can count anything, and the digest's day count lies by the number of stages.
+    """
+    c = cfg(tmp_path)
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    chain = chains.seed(c, conn, "gpu scheduling")
+    draft = db.create_task(conn, chain_id=chain, kind="synthesize",
+                           generator="research", title="synthesize: gpu scheduling")
+    runner.register_artifact(conn, draft, "/tmp/draft.md", "h" * 64,
+                             status="CANDIDATE")
+    assert conn.execute("SELECT COUNT(*) n FROM artifacts").fetchone()["n"] == 1
+    pub = db.create_task(conn, chain_id=chain, kind="publish", generator="research",
+                         title="publish: gpu scheduling", dependencies=[draft.id])
+    runner.promote_candidate(conn, pub, "/tmp/out/final.md", "i" * 64, 4.2)
+    rows = conn.execute("SELECT path, status, score FROM artifacts").fetchall()
+    assert len(rows) == 1, f"publish added a row instead of promoting: {len(rows)}"
+    assert rows[0]["status"] == "PUBLISHED"
+    assert rows[0]["path"] == "/tmp/out/final.md"
+    assert rows[0]["score"] == 4.2
+    conn.close()
+
+
+def test_a_publish_with_no_candidate_of_its_own_still_gets_recorded(
+        tmp_path: Path) -> None:
+    """Hand-queued work must not vanish from the record just because it skipped
+    the stage that normally creates the row."""
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    pub = db.create_task(conn, chain_id=db.new_id(), kind="publish",
+                         generator="research", title="publish: handed over")
+    runner.promote_candidate(conn, pub, "/tmp/x.md", "j" * 64, 4.0)
+    assert conn.execute("SELECT status FROM artifacts").fetchone()["status"] == \
+        "PUBLISHED"
+    conn.close()
+
+
+def test_the_drafting_stages_are_the_ones_named_in_the_plan() -> None:
+    """The set is a reading of PLAN §5, so it is asserted against PLAN rather
+    than against whatever the module happens to contain today."""
+    assert {"synthesize", "analyze", "consolidate", "generate", "write"} <= \
+        chains.DRAFT_KINDS
+    # scaffolding never counts as an output
+    assert not {"plan", "extract", "critique", "evaluate", "publish", "search",
+                "fetch", "scan", "collect"} & chains.DRAFT_KINDS
+    # and every drafting stage thinks: registering a candidate that was produced
+    # without the model would mean an artifact nobody paid for
+    assert chains.DRAFT_KINDS <= chains.THINKING_KINDS
+
+
+async def test_an_intermediate_stage_leaves_no_artifact_row(tmp_path: Path) -> None:
+    """The bug, pinned. `critique` produced a file and registered it, so the
+    kitchen showed a critique of a draft as a second output of the same chain."""
+    c = cfg(tmp_path)
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+
+    class Echo:
+        model = "test-model"
+
+        async def stream(self, req):
+            from cooker.llm import Completion
+            return Completion(text="some prose of substance for the stage",
+                              finish_reason="stop", prompt_tokens=100,
+                              completion_tokens=20, ttft_s=0.1, elapsed_s=0.5,
+                              server_prompt=True, server_completion=True)
+
+        def thinking_for(self, stage: str) -> bool:
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+    r = runner.StageRunner(c, conn, Echo())  # type: ignore[arg-type]
+    for kind in ("plan", "extract", "critique"):
+        t = db.create_task(conn, chain_id=db.new_id(), kind=kind,
+                           generator="research", title=f"{kind}: x")
+        out = await r(t)
+        assert out.status == db.SUCCEEDED, out.as_dict()
+        assert Path(out.path or "").exists(), "the file must still be kept"
+    assert conn.execute("SELECT COUNT(*) n FROM artifacts").fetchone()["n"] == 0, \
+        "scaffolding was registered as output"
+
+    t = db.create_task(conn, chain_id=db.new_id(), kind="synthesize",
+                       generator="research", title="synthesize: x")
+    assert (await r(t)).status == db.SUCCEEDED
+    assert conn.execute("SELECT status FROM artifacts").fetchone()["status"] == \
+        "CANDIDATE"
+    conn.close()
+
+
 # --- Test 1: empty queue self-refills and drains ----------------------
 
 
