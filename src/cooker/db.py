@@ -139,6 +139,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
     scores_json TEXT NOT NULL,
     overall     REAL NOT NULL,
     verdict     TEXT NOT NULL,
+    rationale   TEXT,
     created_at  REAL NOT NULL
 );
 
@@ -190,13 +191,46 @@ def connect(path: str | Path) -> sqlite3.Connection:
     return conn
 
 
+# Columns added after a table first shipped. `CREATE TABLE IF NOT EXISTS` does
+# not alter an existing table, so a column added to SCHEMA alone never reaches a
+# database that already has data — it appears in fresh checkouts and in every test,
+# and is missing on the machine that has been running since M1. Table names here
+# are constants from this dict, never input.
+_ADD_COLS: dict[str, tuple[tuple[str, str], ...]] = {
+    # the evaluator's own sentence, so the digest can quote why something scored
+    # what it scored without a second inference call to find out
+    "evaluations": (("rationale", "TEXT"),),
+}
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> list[str]:
+    added: list[str] = []
+    for table, cols in _ADD_COLS.items():
+        have = {str(r["name"]) for r in
+                conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for name, decl in cols:
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                added.append(f"{table}.{name}")
+    if added:
+        conn.commit()
+    return added
+
+
 def migrate(conn: sqlite3.Connection) -> bool:
-    """Create tables if absent. Returns True if this run created the schema."""
+    """Create tables if absent, add columns that arrived later.
+
+    Returns True if this run created the schema from nothing.
+    """
     existing = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='meta'"
     ).fetchone()
     fresh = existing is None
     conn.executescript(SCHEMA)
+    added = _ensure_columns(conn)
+    if added:
+        emit(conn, "db.migrated", message=f"added columns: {', '.join(added)}",
+             data={"added": added})
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

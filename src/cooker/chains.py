@@ -388,9 +388,27 @@ def advance(cfg: Config, conn: sqlite3.Connection, task: db.Task,
 
     elif kind == "critique":
         made.append(db.create_task(
-            conn, chain_id=task.chain_id, kind="publish", generator=gen,
-            title=f"publish: {payload.get('topic', task.title)[:80]}",
+            conn, chain_id=task.chain_id, kind="evaluate", generator=gen,
+            title=f"evaluate: {payload.get('topic', task.title)[:80]}",
             parent_task_id=task.id, dependencies=[task.id], payload=payload))
+
+    elif kind == "evaluate":
+        # The edge *is* the gate. A rejected draft gets no publish stage at all,
+        # so there is nothing to forget to skip; the rejection is recorded and the
+        # artifact stays in the database as a rejected thing.
+        verdict = str(payload.get("verdict") or "")
+        score = payload.get("score")
+        if verdict == "PUBLISH":
+            made.append(db.create_task(
+                conn, chain_id=task.chain_id, kind="publish", generator=gen,
+                title=f"publish: {payload.get('topic', task.title)[:80]}",
+                parent_task_id=task.id, dependencies=[task.id], payload=payload))
+        else:
+            db.emit(conn, "chain.rejected",
+                    message=f"{payload.get('topic', task.title)[:70]} scored "
+                           f"{score} and was not published",
+                    data={"chain_id": task.chain_id, "task_id": task.id,
+                        "score": score, "verdict": verdict or "UNKNOWN"})
 
     elif kind == "publish":
         db.emit(conn, "chain.complete", message=f"{task.title[:80]}",

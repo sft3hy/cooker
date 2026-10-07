@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cooker import db
+from cooker import eval as eval_mod
 from cooker.config import Config
 from cooker.detect import ACTIVE_INFER, Detector
 
@@ -299,7 +300,13 @@ class Scheduler:
             else:
                 if self.stage_runner is None:
                     raise NoStageRunner("--live needs a stage runner; llm.py lands in M3")
-                claimed = db.claim_next(self.conn)
+                # The RLHF loop, applied at the only place it can bite. Weights,
+                # EMAs and parks elsewhere are bookkeeping: a generator is stopped
+                # by not appearing in the SELECT, so this list is the enforcement
+                # point and every other mention of a parked generator is a report.
+                claimed = db.claim_next(
+                    self.conn,
+                    generators=eval_mod.allowed_generators(self.cfg, self.conn))
                 if claimed is None:
                     break
                 slot = Slot(index, claimed.id, claimed.kind, claimed.generator,
@@ -321,8 +328,16 @@ class Scheduler:
 
     def _pick(self, now: float) -> db.Task | None:
         """The stage we would take next, honouring simulated backoffs so the
-        dry run does not point at the same row every tick."""
+        dry run does not point at the same row every tick.
+
+        Parked generators are skipped here too. A dry run that narrates "would
+        run brainstorm" for work the live path will never claim is a rehearsal
+        that lies about the performance.
+        """
+        allowed = eval_mod.allowed_generators(self.cfg, self.conn)
         for task in db.peek_runnable(self.conn, limit=8):
+            if allowed is not None and task.generator not in allowed:
+                continue
             if task.id in self.sim_reserved and self.sim_reserved[task.id] > now:
                 continue
             return task

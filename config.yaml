@@ -115,6 +115,7 @@ inference:
     extract: 700
     synthesize: 1400
     critique: 900
+    evaluate: 320
     default: 512
   thinking_off_stages:
     # `plan` picks search queries. That is selection, not reasoning, and a chain
@@ -168,8 +169,16 @@ topics:
 quality:
   publish_threshold: 3.5
   dedup_window_days: 14
+  # Below this EMA, and only after this many rated artifacts, the generator is
+  # parked and `claim_next` stops handing it work. The sample size is the point:
+  # one grumpy morning must not switch a generator off permanently.
   feedback_ema_floor: 2.5
   feedback_park_after: 5
+  # Manual parks (`cooker park <generator>`) are honoured alongside the EMA.
+  park_parked_generators: true
+  # A URL fetched inside this window is not fetched again: the cheapest politeness
+  # there is toward an origin you have already read today.
+  url_dedup_days: 7
 
 safety:
   max_disk_gb: 2.0

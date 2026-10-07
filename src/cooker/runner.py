@@ -27,7 +27,6 @@ What is non-negotiable, whatever runs through here:
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -36,6 +35,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from cooker import chains, db, safety
+from cooker import eval as eval_mod
 from cooker import search as search_mod
 from cooker.config import Config
 from cooker.llm import LLM, Completion, EndpointGone, PrefillOver, Request
@@ -149,6 +149,12 @@ class StageRunner:
 
     def prompt_for(self, task: db.Task) -> Request:
         """Build the request. Secrets scanned in, retrieved context fenced."""
+        if task.kind == "evaluate":
+            # A different prompt shape entirely: the evaluator scores work rather
+            # than producing it, and if it is handed the same "produce a note"
+            # instruction it will write a new note and score that, which measures
+            # nothing about the thing we meant to judge.
+            return self._eval_request(task)
         body = task.prompt or (
             f"Produce a short, useful note on: {task.title}. "
             f"Be concrete; no preamble.")
@@ -187,6 +193,45 @@ class StageRunner:
         return Request(system=safety.SYSTEM_DATA_ONLY, user=user,
                        thinking=thinking, kind=task.kind, stage=task.kind,
                        max_tokens=budget)
+
+    def _draft_text(self, task: db.Task) -> str:
+        """The work under review: the synthesize stage's saved artifact.
+
+        `draft_path` first, and this ordering is the whole point. `evaluate`
+        depends on `critique` in the DAG, so resolving purely through
+        `dependencies` hands the evaluator the *review* of the draft and it
+        scores the review — a 4.6 for a critique of a two-sentence nothing, filed
+        against the draft. The recorded path is the fact about what was drafted;
+        the dependency edges are the fact about ordering, and only the first one
+        names the content.
+        """
+        recorded = read_text_if_any(task.payload.get("draft_path"))
+        if recorded.strip():
+            return recorded
+        for dep in list(task.dependencies or []):
+            row = self.conn.execute(
+                "SELECT result_path FROM tasks WHERE id=?", (dep,)).fetchone()
+            if row and row["result_path"]:
+                text = read_text_if_any(row["result_path"])
+                if text.strip():
+                    return text
+        return ""
+
+    def _eval_request(self, task: db.Task) -> Request:
+        draft = self._draft_text(task)
+        sources = [str(s.get("url")) for s in
+                  (task.payload.get("sources") or []) if s.get("url")]
+        budgets = self.cfg.get("inference.stage_max_tokens", {}) or {}
+        if not draft.strip():
+            # Nothing to score. An evaluator that invents a draft to score is how
+            # a nonexistent artifact gets a 4.8 in the database.
+            raise safety.PathRefused("evaluate asked with no draft to read")
+        return Request(system=eval_mod.EVAL_SYSTEM,
+                       user=eval_mod.eval_prompt(
+                           str(task.payload.get("topic") or task.title), draft,
+                           sources),
+                       thinking=False, kind=task.kind, stage=task.kind,
+                       max_tokens=int(budgets.get("evaluate", 320)))
 
     # --- dispatch --------------------------------------------------------
 
@@ -320,17 +365,35 @@ class StageRunner:
         return Outcome(task.id, db.SUCCEEDED, children=tuple(k.id for k in kids))
 
     async def _publish(self, task: db.Task, t0: float) -> Outcome:
+        # The gate, checked at the gate. The absence of a publish stage would
+        # normally mean this never runs, but a hand-queued publish or a chain
+        # built by an older version of `advance` should not get a free pass: the
+        # threshold is enforced where the work leaves the building, not only where
+        # the DAG was drawn.
+        ev = self.conn.execute(
+            "SELECT overall, verdict FROM evaluations WHERE task_id IN ({})"
+            " ORDER BY created_at DESC LIMIT 1"
+            .format(",".join("?" * max(1, len(task.dependencies)))),
+            tuple(task.dependencies) or ("",)).fetchone() if task.dependencies else None
+        threshold = float(self.cfg.get("quality.publish_threshold", 3.5))
+        score = float(ev["overall"]) if ev else 0.0
+        verdict = str(ev["verdict"]) if ev else "UNEVALUATED"
+        if verdict != "PUBLISH" or score < threshold:
+            reason = (f"not cleared the threshold: {verdict} at {score:.2f} "
+                     f"(needs >= {threshold})")
+            db.finish(self.conn, task.id, db.REJECTED, error=reason,
+                      duration_ms=(time.perf_counter() - t0) * 1000)
+            self.emit("publish.blocked", f"{task.title[:60]}: {reason}",
+                      {"task_id": task.id, "score": score, "verdict": verdict})
+            return Outcome(task.id, db.REJECTED, reason=reason)
+
         src = task.payload.get("draft_path")
         if not src and task.dependencies:
-            r = self.conn.execute(
+            row = self.conn.execute(
                 "SELECT result_path FROM tasks WHERE id=?",
                 (task.dependencies[0],)).fetchone()
-            src = r["result_path"] if r else None
-        # Off the loop. A draft is a few kilobytes today, and the day the chain
-        # synthesises a 2 MB review of a monorepo is the day a blocked loop
-        # misses the preemption tick that was supposed to free the GPU.
-        text = await asyncio.to_thread(read_text_if_any, src) \
-            if src else ""
+            src = row["result_path"] if row else None
+        text = await asyncio.to_thread(read_text_if_any, src) if src else ""
         if not text.strip():
             reason = "nothing to publish"
             db.finish(self.conn, task.id, db.FAILED, error=reason,
@@ -343,8 +406,28 @@ class StageRunner:
                       f"redacted {sum(f.count for f in scan.findings)} span(s) "
                       f"at publish", {"task_id": task.id, **scan.as_dict()})
         day = chains.day_dir(self.cfg)
-        target = day / f"{slug_dirname(task)}.md"
-        digest = hashlib.sha256(scan.text.encode()).hexdigest()
+        # §7 layout: outputs/YYYY-MM-DD/<generator>/<topic>.md. A flat day
+        # directory turns a morning with research and reviews and a digest into
+        # eleven indistinguishable markdown files, and the digest links into these
+        # paths, so the structure is the reader's index.
+        target = day / task.generator / f"{slug_dirname(task)}.md"
+        # The specced hash: sha256(prompt || normalized_result). Using the raw
+        # text hash instead would call two notes distinct because one has a
+        # trailing space, which is not the duplicate anyone meant.
+        digest = eval_mod.result_hash(
+            task.prompt or str(task.payload.get("topic") or ""), scan.text)
+        dup = eval_mod.find_duplicate(self.conn, digest, exclude_id=task.id)
+        if dup:
+            # Not an error and not a success: the work exists, it is the same work
+            # you already have, and the audit trail should say that in so many
+            # words rather than quietly re-publishing.
+            reason = f"duplicate of artifact {dup[:8]}"
+            db.finish(self.conn, task.id, db.REJECTED, error=reason,
+                      result_hash=digest,
+                      duration_ms=(time.perf_counter() - t0) * 1000)
+            self.emit("publish.duplicate", f"{task.title[:60]}: {reason}",
+                      {"task_id": task.id, "duplicate_of": dup})
+            return Outcome(task.id, db.REJECTED, reason=reason)
         # The write and the finish are ordered deliberately: the file exists and
         # is hashed before the row claims it does. The other order leaves a row
         # pointing at a file that is not there yet, which `synthesize` reads back
@@ -354,6 +437,7 @@ class StageRunner:
                   result_hash=digest,
                   duration_ms=(time.perf_counter() - t0) * 1000)
         register_artifact(self.conn, task, str(target), digest, status="PUBLISHED")
+        eval_mod.mark_result_seen(self.conn, digest, task.id)
         self.emit("runner.published",
                   f"{task.generator}: {target.name} "
                   f"({len(scan.text)} chars, no GPU)",
@@ -417,6 +501,9 @@ class StageRunner:
                       {"task_id": task.id, **comp.as_dict()})
             return Outcome(task.id, db.FAILED, reason=reason, completion=comp)
 
+        if task.kind == "evaluate":
+            return self._evaluate(task, comp, t0)
+
         flags = safety.looks_instructed(comp.text)
         if flags:
             self.emit("safety.injection_flags",
@@ -452,6 +539,45 @@ class StageRunner:
         kids = chains.advance(self.cfg, self.conn, task, result_text=comp.text)
         self.last_stage_ms[task.kind] = round((time.perf_counter() - t0) * 1000, 1)
         return Outcome(task.id, db.SUCCEEDED, path=str(path), completion=comp,
+                       children=tuple(k.id for k in kids))
+
+    def _evaluate(self, task: db.Task, comp: Completion, t0: float) -> Outcome:
+        """Parse the rubric, store the judgement, decide whether publish exists.
+
+        An unparsable judgement is a FAILED stage, not a REJECT. "The judge could
+        not read the score sheet" and "the work was not good enough" are different
+        facts, and collapsing them means a formatting hiccup silently becomes a
+        quality decision that you cannot tell apart from the real thing later.
+        """
+        threshold = float(self.cfg.get("quality.publish_threshold", 3.5))
+        ev = eval_mod.parse_eval(comp.text, threshold=threshold)
+        eval_mod.record(self.conn, task.id, ev)
+        db.merge_payload(self.conn, task.id, {"score": ev.overall,
+                                              "verdict": ev.verdict,
+                                              "rationale": ev.rationale})
+        if not ev.parsed:
+            reason = "evaluation output did not parse"
+            db.finish(self.conn, task.id, db.FAILED, error=reason,
+                      input_tokens=comp.prompt_tokens,
+                      output_tokens=comp.completion_tokens,
+                      ttft_ms=(comp.ttft_s or 0) * 1000,
+                      duration_ms=(time.perf_counter() - t0) * 1000)
+            self.emit("runner.failed",
+                      f"evaluate: {reason}; raw={ev.raw[:120]!r}",
+                      {"task_id": task.id, **ev.as_dict()})
+            return Outcome(task.id, db.FAILED, reason=reason, completion=comp)
+
+        db.finish(self.conn, task.id, db.SUCCEEDED, score=ev.overall,
+                  input_tokens=comp.prompt_tokens,
+                  output_tokens=comp.completion_tokens,
+                  ttft_ms=(comp.ttft_s or 0) * 1000,
+                  duration_ms=(time.perf_counter() - t0) * 1000)
+        self.emit("runner.evaluated",
+                  f"{task.payload.get('topic', task.title)[:60]} -> "
+                  f"{ev.overall:.2f} {ev.verdict}",
+                  {"task_id": task.id, **ev.as_dict()})
+        kids = chains.advance(self.cfg, self.conn, task, result_text=comp.text)
+        return Outcome(task.id, db.SUCCEEDED, completion=comp,
                        children=tuple(k.id for k in kids))
 
     # --- the document ----------------------------------------------------

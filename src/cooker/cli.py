@@ -18,9 +18,11 @@ import sqlite3
 import subprocess
 import sys
 import time
+from datetime import date
 from pathlib import Path
 
-from cooker import __version__, daemon, db, detect, net
+from cooker import __version__, daemon, db, detect, digest, net
+from cooker import eval as eval_mod
 from cooker.config import Config, load_config
 
 OK, WARN, FAIL, INFO = "\033[32m✓\033[0m", "\033[33m!\033[0m", "\033[31m✗\033[0m", "·"
@@ -496,6 +498,104 @@ def cmd_resume(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+# --- the feedback loop (M5) ----------------------------------------------
+
+
+def cmd_rate(cfg: Config, args: argparse.Namespace) -> int:
+    """`cooker rate <id> good|meh|bad` — the entire RLHF input in one keystroke.
+
+    Refuses an id it cannot resolve. A typo that silently records feedback is worse
+    than a typo that errors, because the thing you read afterwards is the EMA, and
+    it will have absorbed a rating attached to nothing.
+    """
+    conn = db.connect(cfg.db_path)
+    db.migrate(conn)
+    try:
+        out = eval_mod.add_feedback(conn, args.id, args.rating,
+                                     note=" ".join(args.note) or None)
+    except ValueError as exc:
+        print(f"{FAIL} {exc}")
+        conn.close()
+        return 1
+    gen = out["generator"]
+    floor = cfg.get("quality.feedback_ema_floor", 2.5)
+    after = int(cfg.get("quality.feedback_park_after", 5))
+    line = f"{OK} rated {gen} {args.rating}"
+    if out["ema"] is not None:
+        line += f"  ema={out['ema']:.2f}"
+    n = eval_mod.rated_count(conn, gen) if gen else 0
+    line += f"  ({n} rated; parks under {floor} after {after})"
+    print(line)
+    parked = eval_mod.parked_generators(cfg, conn)
+    if gen in parked:
+        print(f"{WARN} {gen} is parked — the scheduler will not claim from it.")
+        print(f"      reason: {parked[gen]}")
+        print(f"      'cooker unpark {gen}' to override, or let the EMA recover.")
+    conn.close()
+    return 0
+
+
+def cmd_digest(cfg: Config, args: argparse.Namespace) -> int:
+    """Write today's digest and print the path. `--day` for a specific date."""
+    conn = db.connect(cfg.db_path)
+    db.migrate(conn)
+    day = None
+    if getattr(args, "day", None):
+        try:
+            day = date.fromisoformat(args.day)
+        except ValueError:
+            print(f"{FAIL} --day wants YYYY-MM-DD, got {args.day!r}")
+            conn.close()
+            return 1
+    path, published = digest.write(cfg, conn, day=day)
+    print(f"{OK} wrote {path}  ({published} item(s) above threshold)")
+    conn.close()
+    return 0
+
+
+def cmd_park(cfg: Config, args: argparse.Namespace) -> int:
+    """Stop a generator by hand. The reason is stored, because future-you will ask."""
+    conn = db.connect(cfg.db_path)
+    db.migrate(conn)
+    parked = eval_mod.park(conn, args.generator,
+                           reason=" ".join(args.note) or "parked by hand")
+    print(f"{OK} parked {args.generator}: {parked[args.generator]}")
+    print(f"      allowed now: {', '.join(eval_mod.allowed_generators(cfg, conn) or [])}")
+    conn.close()
+    return 0
+
+
+def cmd_unpark(cfg: Config, args: argparse.Namespace) -> int:
+    conn = db.connect(cfg.db_path)
+    db.migrate(conn)
+    eval_mod.unpark(conn, args.generator)
+    allowed = eval_mod.allowed_generators(cfg, conn)
+    print(f"{OK} unparked {args.generator}")
+    if args.generator not in (allowed or []):
+        print(f"{WARN} still not claimed: its feedback EMA is below the floor"
+              f" ({eval_mod.generator_ema(conn, args.generator)})")
+    conn.close()
+    return 0
+
+
+def cmd_feedback(cfg: Config, args: argparse.Namespace) -> int:
+    """The loop, printed: what is allowed, what is parked, and the EMA of each."""
+    conn = db.connect(cfg.db_path)
+    db.migrate(conn)
+    st = eval_mod.state(conn, cfg)
+    print(f"threshold {st['threshold']}   "
+          f"allowed {st['allowed'] if st['allowed'] != 'unfiltered' else 'unfiltered'}")
+    for gen, ema in sorted(st["ema"].items()):
+        n = eval_mod.rated_count(conn, gen)
+        mark = "PARKED" if gen in st["parked"] else "ok"
+        print(f"  {gen:<18} ema={'—' if ema is None else f'{ema:.2f}'}"
+              f"  rated={n}  {mark}")
+    for gen, reason in st["parked"].items():
+        print(f"  {gen}: {reason}")
+    conn.close()
+    return 0
+
+
 # --- entrypoint -----------------------------------------------------------
 
 
@@ -628,6 +728,28 @@ def build_parser() -> argparse.ArgumentParser:
     pa.set_defaults(func=cmd_pause)
 
     sub.add_parser("resume", help="undo a pause").set_defaults(func=cmd_resume)
+
+    rt = sub.add_parser("rate", help="rate a published artifact (the RLHF input)")
+    rt.add_argument("id", help="artifact id, task id, or the 8-char prefix the digest prints")
+    rt.add_argument("rating", choices=["good", "meh", "bad"])
+    rt.add_argument("note", nargs="*", help="optional, why")
+    rt.set_defaults(func=cmd_rate)
+
+    dg = sub.add_parser("digest", help="write today's digest now")
+    dg.add_argument("--day", default=None, help="YYYY-MM-DD (default: today)")
+    dg.set_defaults(func=cmd_digest)
+
+    fb = sub.add_parser("feedback", help="the loop: EMAs, what is allowed, what is parked")
+    fb.set_defaults(func=cmd_feedback)
+
+    pk = sub.add_parser("park", help="stop a generator by hand")
+    pk.add_argument("generator")
+    pk.add_argument("note", nargs="*", help="why, stored with the park")
+    pk.set_defaults(func=cmd_park)
+
+    up = sub.add_parser("unpark", help="re-enable a parked generator")
+    up.add_argument("generator")
+    up.set_defaults(func=cmd_unpark)
     return p
 
 

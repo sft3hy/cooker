@@ -18,12 +18,14 @@ its dry-run half asserts that nothing was written.
 from __future__ import annotations
 
 import contextlib
+import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 from cooker import chains, daemon, db, runner, safety
+from cooker import eval as eval_mod
 from cooker import search as search_mod
 from cooker.config import Config
 
@@ -305,6 +307,14 @@ def test_zero_usable_sources_fails_at_fetch_and_wedges_nothing(tmp_path: Path) -
 
 
 def test_critique_and_publish_follow_the_draft(tmp_path: Path) -> None:
+    """M5 shape: synthesize -> critique -> evaluate -> publish, and the verdict
+    on the evaluate row is what decides whether `publish` is ever created.
+
+    The old version of this test asserted critique -> publish. That was the M4
+    shape, where nothing judged the work between those two edges, so the chain
+    published whatever came out of critique. Asserting the old shape now would
+    mean asserting a gate that no longer exists.
+    """
     c = cfg(tmp_path)
     conn = db.connect(":memory:")
     db.migrate(conn)
@@ -316,12 +326,46 @@ def test_critique_and_publish_follow_the_draft(tmp_path: Path) -> None:
     kids = chains.advance(c, conn, db.Task.from_row(
         conn.execute("SELECT * FROM tasks WHERE id=?", (synth,)).fetchone()))
     assert [k.kind for k in kids] == ["critique"]
+
     crit = kids[0]
     db.finish(conn, crit.id, db.SUCCEEDED)
     kids2 = chains.advance(c, conn, db.Task.from_row(
         conn.execute("SELECT * FROM tasks WHERE id=?", (crit.id,)).fetchone()))
-    assert [k.kind for k in kids2] == ["publish"]
+    assert [k.kind for k in kids2] == ["evaluate"]
+
+    ev = kids2[0]
+    db.finish(conn, ev.id, db.SUCCEEDED, score=4.2)
+    db.merge_payload(conn, ev.id, {"score": 4.2, "verdict": "PUBLISH"})
+    row = db.Task.from_row(
+        conn.execute("SELECT * FROM tasks WHERE id=?", (ev.id,)).fetchone())
+    kids3 = chains.advance(c, conn, row)
+    assert [k.kind for k in kids3] == ["publish"]
     assert kinds(conn, chain)["critique"] == db.SUCCEEDED
+    conn.close()
+
+
+def test_a_reject_leaves_no_publish_stage_to_run(tmp_path: Path) -> None:
+    """Rejected work must not have a publish task waiting on a forgotten flag.
+
+    If `advance` created publish anyway, then publishing depends on every caller
+    remembering to check the score. Creating nothing at all means the gate cannot
+    be bypassed by a code path someone forgot to update.
+    """
+    c = cfg(tmp_path)
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    chain = chains.seed(c, conn, "gpu scheduling")
+    ev = db.create_task(conn, chain_id=chain, kind="evaluate",
+                        generator="research", title="e",
+                        payload={"topic": "t", "score": 2.6, "verdict": "REJECT"})
+    db.finish(conn, ev.id, db.SUCCEEDED, score=2.6)
+    assert chains.advance(c, conn, db.Task.from_row(
+        conn.execute("SELECT * FROM tasks WHERE id=?", (ev.id,)).fetchone())) == []
+    kinds_now = kinds(conn, chain)
+    assert "publish" not in kinds_now
+    rejected = [e for e in db.tail_events(conn) if e["type"] == "chain.rejected"]
+    assert rejected, "the rejection has to be visible, not just absent"
+    assert json.loads(rejected[-1]["data_json"] or "{}")["score"] == 2.6
     conn.close()
 
 
@@ -527,18 +571,58 @@ async def test_publish_writes_no_secrets_and_promotes_the_artifact(
     chain = chains.seed(c, conn, "gpu scheduling")
     draft = tmp_path / "draft.md"
     draft.write_text("# brief\n\nAKIAIOSFODNN7EXAMPLE is the key.\n", encoding="utf-8")
+    # The gate is real now: publish reads its dependency's evaluation, so this
+    # test has to produce one. A publish that succeeds without it would mean the
+    # threshold lives only in `advance` and any other path walks straight past it.
+    ev = db.create_task(conn, chain_id=chain, kind="evaluate",
+                        generator="research", title="evaluate: gpu scheduling")
+    db.finish(conn, ev.id, db.SUCCEEDED, score=4.2)
+    eval_mod.record(conn, ev.id, eval_mod.EvalResult(
+        scores={a: 4 for a in eval_mod.RUBRIC}, overall=4.2, verdict="PUBLISH",
+        rationale="accurate and actionable"))
     t = db.create_task(conn, chain_id=chain, kind="publish", generator="research",
                       title="publish: gpu scheduling",
+                      dependencies=[ev.id],
                       payload={"topic": "gpu scheduling", "draft_path": str(draft)})
     out = await r(t)
     assert out.status == db.SUCCEEDED, out.as_dict()
     body = Path(out.path or "").read_text()
     assert "AKIAIOSFODNN7EXAMPLE" not in body, "secret published"
     assert "[REDACTED:aws-access-key]" in body
+    assert "research" in Path(out.path or "").parts, \
+        "published outside the generator subdirectory the layout specifies"
     art = conn.execute("SELECT status, path FROM artifacts ORDER BY created_at"
                        ).fetchall()
     assert art[-1]["status"] == "PUBLISHED"
     assert chain in str(art[-1]["path"]) or out.path
+    conn.close()
+
+
+async def test_publish_refuses_work_that_was_never_judged(tmp_path: Path) -> None:
+    """The gate at the gate, not only in the DAG.
+
+    A publish whose dependency has no evaluation row is the case that matters:
+    a hand-queued publish, or a chain built by an older binary. Refusing it costs
+    one artifact; publishing it means the threshold is advisory, and every future
+    "did we ever ship something unjudged?" question has no answer.
+    """
+    c = cfg(tmp_path)
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    r = runner.StageRunner(c, conn, NoGPU(), searcher=FakeSearcher(c))  # type: ignore[arg-type]
+    chain = chains.seed(c, conn, "gpu scheduling")
+    draft = tmp_path / "d.md"
+    draft.write_text("# fine\n\nA perfectly ordinary paragraph about prefill.\n",
+                     encoding="utf-8")
+    t = db.create_task(conn, chain_id=chain, kind="publish", generator="research",
+                      title="publish: unjudged",
+                      payload={"topic": "t", "draft_path": str(draft)})
+    out = await r(t)
+    assert out.status == db.REJECTED, out.as_dict()
+    assert not list(chains.day_dir(c).rglob("*.md")), \
+        "an unjudged artifact reached the filesystem"
+    blocked = [e for e in db.tail_events(conn) if e["type"] == "publish.blocked"]
+    assert blocked, "the refusal has to be in the log, not just in the status"
     conn.close()
 
 
@@ -590,6 +674,11 @@ async def test_live_seed_then_the_queue_drains(tmp_path: Path) -> None:
         "extract": "Prefill is atomic on omlx; chunking fixes it.",
         "synthesize": "Prefill is exclusive today; chunked prefill interleaves.",
         "critique": "Accurate, sourced, actionable. 4/5.",
+        # strict JSON, five axes, overall 4.0 — above the 3.5 gate, so publish
+        # exists. Shape matters more than the numbers here: a prose critique from
+        # the evaluator stage must not be mistaken for a verdict.
+        "evaluate": '{"usefulness":4,"accuracy":4,"novelty":3,'
+                    '"actionability":4,"relevance":5,"rationale":"solid"}',
     }
 
     class TinyLLM:
@@ -659,9 +748,11 @@ async def test_live_seed_then_the_queue_drains(tmp_path: Path) -> None:
     assert "extract" in done_kinds and "synthesize" in done_kinds, done_kinds
     assert st["done"] == st["total"], f"chain stalled at {st['done']}/{st['total']}"
     assert db.queue_counts(conn)["QUEUED"] == 0, "the queue never drained"
-    assert llm.kinds == ["plan", "extract", "extract", "synthesize", "critique"], \
-        llm.kinds
-    published = list(chains.day_dir(c).glob("*.md"))
+    # `evaluate` sits between critique and publish now: seven GPU-touching stages
+    # where M4 had six, and the queue still ends empty.
+    assert llm.kinds == ["plan", "extract", "extract", "synthesize", "critique",
+                         "evaluate"], llm.kinds
+    published = list(chains.day_dir(c).rglob("*.md"))
     assert published, "nothing published"
     assert safety.scan_secrets(published[0].read_text()).clean
     conn.close()
