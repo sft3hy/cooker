@@ -8,7 +8,46 @@
   import { render, hitTestPot, W, H } from './kitchen.js';
   import { bubble, unlock } from './sfx.js';
 
-  let { snap, log, serveFlash, openArtifact } = $props();
+  let { snap, log, serveFlash, openArtifact, onOrdered } = $props();
+
+  // The order counter. Sam writes, the kitchen takes the ticket. deep-dive
+  // means "put it to opencode and let it dig" (minutes, one big burn);
+  // research is the kitchen's own five-stage way. Neither buys a pass at
+  // the judge — the ticket buys attention, not the verdict.
+  let order = $state({ topic: '', kind: 'deep-dive', note: '', busy: false });
+  let tickets = $state([]);
+
+  async function loadTickets() {
+    try {
+      const r = await fetch('./api/orders');
+      if (r.ok) tickets = (await r.json()).orders || [];
+    } catch { /* the counter can wait */ }
+  }
+
+  async function submitOrder() {
+    const topic = order.topic.trim();
+    if (topic.length < 8) { order.note = 'a topic of 8+ characters, please'; return; }
+    order.busy = true; order.note = '';
+    try {
+      const r = await fetch('./api/orders', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ topic, kind: order.kind }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok) {
+        order.note = '✓ order taken — it queues like everything else';
+        order.topic = '';
+        onOrdered?.();
+        loadTickets();
+      } else {
+        order.note = d.error || `the counter says no (${r.status})`;
+      }
+    } catch {
+      order.note = 'the counter is unreachable';
+    } finally {
+      order.busy = false;
+    }
+  }
 
   let canvas = $state(null);
   let wrap = $state(null);
@@ -118,6 +157,7 @@
   }
 
   onMount(() => {
+    loadTickets();
     computeScale();
     window.addEventListener('resize', computeScale);
     // fonts change metrics and the fit is arithmetic on them; redraw is every
@@ -165,6 +205,40 @@
       <span class="why">no state</span>
     {/if}
   </div>
+</section>
+
+<section class="counter">
+  <div class="rail">
+    <span class="sign" class:closed={!snap?.gate?.ready && !(snap?.workers?.slots || []).length}
+          class:cooking={(snap?.workers?.slots || []).length > 0}>
+      {(snap?.workers?.slots || []).length ? 'COOKING' : (snap?.gate?.ready ? 'OPEN' : 'CLOSED')}
+    </span>
+    <h2>order at the counter</h2>
+  </div>
+  <div class="ticket">
+    <textarea class="paper" rows="3" maxlength="200" placeholder="what should the kitchen look into? (8-200 chars)"
+              bind:value={order.topic}></textarea>
+    <div class="ticket-foot">
+      <div class="kinds">
+        <button class="k" class:on={order.kind === 'deep-dive'} onclick={() => order.kind = 'deep-dive'}>DEEP-DIVE</button>
+        <button class="k" class:on={order.kind === 'research'} onclick={() => order.kind = 'research'}>RESEARCH</button>
+      </div>
+      <button class="send" onclick={submitOrder} disabled={order.busy}>{order.busy ? 'writing…' : 'SEND ORDER'}</button>
+    </div>
+    <p class="mean">deep-dive = hand it to opencode and let it dig (minutes). research = the five-stage way, tonight's quieter kitchen. both face the same judge — ordering never buys a pass.</p>
+    {#if order.note}<p class="note" class:ok={order.note.startsWith('✓')}>{order.note}</p>{/if}
+  </div>
+  {#if tickets.length}
+    <ul class="tickets">
+      {#each tickets as tk (tk.id)}
+        <li>
+          <span class="tk-kind">{tk.kind}</span>
+          <span class="tk-topic">{tk.topic}</span>
+          <span class="tk-status s-{tk.status.toLowerCase()}">{tk.status.toLowerCase()}{#if tk.score != null} · {tk.score}{/if}</span>
+        </li>
+      {/each}
+    </ul>
+  {/if}
 </section>
 
 {#if drawer}
@@ -285,4 +359,53 @@
   }
   .ticker p { padding: 1px 0; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 0; }
   .ticker code { color: var(--cyan); font-size: 10px; }
+
+  .counter { margin: 14px 0 4px; }
+  .rail { display: flex; align-items: center; gap: 12px; }
+  .counter h2 { font-family: "Press Start 2P", monospace; font-size: 10px; color: var(--dim); margin: 0; }
+  .sign {
+    font-family: "Press Start 2P", monospace; font-size: 11px; padding: 6px 10px;
+    color: var(--green); border: 2px solid var(--green);
+    text-shadow: 0 0 8px rgba(111, 207, 124, 0.9), 0 0 22px rgba(111, 207, 124, 0.45);
+    animation: hum 2.4s steps(2, jump-none) infinite;
+  }
+  .sign.closed { color: var(--red); border-color: var(--red);
+    text-shadow: 0 0 8px rgba(224, 82, 82, 0.9), 0 0 22px rgba(224, 82, 82, 0.4); animation: none; }
+  .sign.cooking { color: var(--amber); border-color: var(--amber);
+    text-shadow: 0 0 8px rgba(255, 179, 71, 0.95), 0 0 24px rgba(255, 159, 67, 0.5); animation: none; }
+  @keyframes hum { 50% { opacity: 0.82; } }
+  .ticket {
+    margin-top: 8px; background: var(--paper, #f2e7cf);
+    border: 2px solid #cbb98f; padding: 10px 12px;
+    box-shadow: 0 3px 0 #16101e; transform: rotate(-0.35deg);
+  }
+  .paper {
+    width: 100%; box-sizing: border-box; background: transparent; resize: vertical;
+    border: none; border-bottom: 1px dashed #b39b6a; outline: none;
+    font: 13px/1.7 ui-monospace, "SF Mono", Menlo, monospace; color: #3a2f1d;
+  }
+  .paper::placeholder { color: #9c8a63; }
+  .ticket-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; gap: 8px; flex-wrap: wrap; }
+  .kinds { display: flex; gap: 6px; }
+  .k, .send {
+    font-family: "Press Start 2P", monospace; font-size: 8px; cursor: pointer;
+    background: transparent; border: 2px solid #8a7654; color: #5c4a2e; padding: 7px 9px;
+  }
+  .k.on { background: #5c4a2e; color: #f2e7cf; border-color: #5c4a2e; }
+  .send { border-color: #7a4f1d; color: #7a4f1d; }
+  .send:hover { background: var(--amber); color: #241c2e; }
+  .mean { color: #8a7654; font-size: 10px; margin: 8px 0 0; line-height: 1.5; }
+  .note { color: #7a4f1d; font-size: 11px; margin: 6px 0 0; }
+  .note.ok { color: #2f7d3c; }
+  .tickets { list-style: none; padding: 0; margin: 10px 0 0; }
+  .tickets li {
+    display: flex; gap: 8px; align-items: baseline; font-size: 11px;
+    padding: 3px 8px; border-bottom: 1px dotted #322640; color: var(--dim);
+  }
+  .tk-kind { font-family: "Press Start 2P", monospace; font-size: 7px; color: var(--cyan); }
+  .tk-topic { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .s-running { color: var(--amber); }
+  .s-succeeded, .s-published { color: var(--green); }
+  .s-failed, .s-rejected { color: var(--red); }
+
 </style>

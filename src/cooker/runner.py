@@ -36,6 +36,7 @@ from urllib.parse import urlparse
 
 from cooker import chains, db, safety
 from cooker import eval as eval_mod
+from cooker import opencode as opencode_mod
 from cooker import search as search_mod
 from cooker.config import Config
 from cooker.llm import (
@@ -53,6 +54,35 @@ from cooker.llm import (
 # few hundred tokens to save thousands of irrelevant fetches.
 FREE_KINDS = frozenset({"search", "fetch", "publish", "collect", "scan",
                         "consolidate"})
+
+
+# The brief a deep-dive hands opencode. It is written for an assistant
+# with no human on the glass: every question it might ask is pre-answered
+# here, because "answer its prompts when it asks questions" is the owner's
+# ask and the honest implementation answers them twice — once in the brief,
+# once in the permission/form tenders when the model asks anyway (§21).
+DELEGATE_BRIEF = """You are running unattended as Cooker's delegated research \
+tool on Sam's home server. Nobody is watching a terminal: do not ask \
+questions — state assumptions instead, and answer every form or prompt by \
+proceeding.
+
+Subject of the deep-dive: {topic}
+
+Work only inside the current working directory. Use web search if a provider \
+is configured; otherwise work from what you know and mark every gap honestly \
+as "unverified". Never read .env files, keys, or anything outside this \
+directory.
+
+Deliver, as your final assistant message (not as a file): a markdown brief of \
+500-900 words with exactly these sections:
+
+## What it is
+## Why it matters on a home server
+## How to try it
+## Sources
+
+Sources lists the real URLs you actually used, or says "none — internal \
+knowledge, gaps marked unverified." """
 
 
 @dataclass
@@ -78,10 +108,15 @@ class StageRunner:
     """
 
     def __init__(self, cfg: Config, conn: sqlite3.Connection, llm: LLM,
-                 searcher: search_mod.Searcher | None = None) -> None:
+                 searcher: search_mod.Searcher | None = None,
+                 oc: opencode_mod.OpenCode | None = None) -> None:
         self.cfg = cfg
         self.conn = conn
         self.llm = llm
+        # The delegation tool exists only when the daemon is live and the
+        # owner has enabled it; dry-run has no hands, which is the same
+        # guarantee the missing llm object gives for the GPU socket.
+        self.oc = oc
         self.searcher = searcher or search_mod.Searcher(
             cfg, emit=self.emit, client=getattr(llm, "shared_client", None))
         self.runs = 0
@@ -277,9 +312,108 @@ class StageRunner:
 
     async def __call__(self, task: db.Task) -> Outcome:
         self.runs += 1
+        if task.kind == "delegate":
+            # Neither free nor thinking in the usual sense: the GPU burns,
+            # but through opencode's hands on the same omlx, so the ledger
+            # sees the traffic and the kitchen subtracts it as ours (§21).
+            return await self._delegate(task)
         if task.kind in FREE_KINDS:
             return await self._free(task)
         return await self._thinking(task)
+
+    # --- the delegated stage: opencode does the reaching ------------------
+
+    async def _delegate(self, task: db.Task) -> Outcome:
+        """M9: the deep-dive burns other hands. One opencode session, in a
+        workspace directory that must already exist (verified live: the
+        server creates sessions for missing directories and only refuses at
+        prompt time), tended by policy while it runs, interrupted the
+        instant the ledger says someone else wants the GPU.
+        """
+        t0 = time.perf_counter()
+        topic = str(task.payload.get("topic") or task.title)
+        if self.oc is None:
+            reason = "delegation asked with no opencode client (dry-run?)"
+            db.finish(self.conn, task.id, db.FAILED, error=reason,
+                      duration_ms=(time.perf_counter() - t0) * 1000)
+            self.emit("runner.failed", f"delegate: {reason}",
+                      {"task_id": task.id})
+            return Outcome(task.id, db.FAILED, reason=reason)
+        prompt = DELEGATE_BRIEF.replace("{topic}", topic)
+        scan = safety.scan_secrets(prompt, source=f"delegate:{task.id}.prompt")
+        if scan.blocked:
+            db.finish(self.conn, task.id, db.REJECTED,
+                      error=f"safety: {scan.as_dict()}",
+                      duration_ms=(time.perf_counter() - t0) * 1000)
+            self.emit("runner.rejected", "delegate prompt withheld by safety",
+                      {"task_id": task.id})
+            return Outcome(task.id, db.REJECTED, reason="prompt withheld")
+        workdir = chains.day_dir(self.cfg) / "delegations" / task.id
+        await asyncio.to_thread(workdir.mkdir, parents=True, exist_ok=True)
+        try:
+            res = await self.oc.run(title=f"deep-dive: {topic[:80]}",
+                                     prompt=scan.text, workdir=workdir)
+        except asyncio.CancelledError:
+            self.aborts += 1
+            self.emit("runner.cancelled",
+                      f"deep-dive.delegate cancelled after "
+                      f"{time.perf_counter() - t0:.2f}s",
+                      {"task_id": task.id})
+            raise
+        except opencode_mod.OpenCodeError as exc:
+            db.finish(self.conn, task.id, db.FAILED, error=str(exc),
+                      duration_ms=(time.perf_counter() - t0) * 1000)
+            self.emit("runner.failed", f"delegate: {exc}",
+                      {"task_id": task.id})
+            return Outcome(task.id, db.FAILED, reason=str(exc))
+        if not res.text.strip():
+            reason = f"opencode returned no text (notes: {'; '.join(res.notes)})"
+            db.finish(self.conn, task.id, db.FAILED, error=reason,
+                      duration_ms=(time.perf_counter() - t0) * 1000)
+            self.emit("runner.empty", f"delegate: {reason}",
+                      {"task_id": task.id})
+            return Outcome(task.id, db.FAILED, reason=reason)
+        flags = safety.looks_instructed(res.text)
+        if flags:
+            self.emit("safety.injection_flags",
+                      f"delegated brief carries instruction-shaped text: "
+                      f"{', '.join(flags)}", {"task_id": task.id})
+        doc = (f"# {topic}\n\n{res.text}\n\n---\n\n"
+               f"*delegated to opencode session {res.session_id}; "
+               f"{res.permissions_granted}/{res.permissions_seen} permissions "
+               f"granted (policy), {res.forms_answered} form(s) answered; "
+               f"{'completed' if res.completed else 'stopped early'}*\n")
+        try:
+            path, digest = await asyncio.to_thread(
+                safety.write_workspace_file, self.cfg, task.id,
+                "deep-dive-delegate.md", doc)
+        except safety.PathRefused as exc:
+            db.finish(self.conn, task.id, db.FAILED, error=str(exc))
+            return Outcome(task.id, db.FAILED, reason=str(exc))
+        db.merge_payload(self.conn, task.id, {
+            "draft_path": str(path), "session_id": res.session_id,
+            "delegation": {"completed": res.completed,
+                           "permissions_seen": res.permissions_seen,
+                           "granted": res.permissions_granted,
+                           "forms": res.forms_answered,
+                           "notes": res.notes[:5]}})
+        db.finish(self.conn, task.id, db.SUCCEEDED, result_path=str(path),
+                  result_hash=digest, input_tokens=res.input_tokens,
+                  output_tokens=res.output_tokens,
+                  ttft_ms=(res.first_text_s or 0) * 1000,
+                  duration_ms=(time.perf_counter() - t0) * 1000)
+        register_artifact(self.conn, task, str(path), digest,
+                          status=db.CANDIDATE)
+        self.emit("runner.stage",
+                  f"deep-dive.delegate -> {path.name} ({len(res.text)} chars, "
+                  f"{res.output_tokens} tok via opencode, "
+                  f"{time.perf_counter() - t0:.1f}s)",
+                  {"task_id": task.id, "gpu": True, "via": "opencode",
+                   "session_id": res.session_id})
+        kids = chains.advance(self.cfg, self.conn, task, result_text=res.text)
+        self.last_stage_ms[task.kind] = round((time.perf_counter() - t0) * 1000, 1)
+        return Outcome(task.id, db.SUCCEEDED, path=str(path),
+                       children=tuple(k.id for k in kids))
 
     # --- the free stages: network and disk, never the GPU --------------
 

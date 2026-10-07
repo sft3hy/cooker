@@ -902,3 +902,31 @@ def test_wrapped_prose_above_the_list_is_not_queue(tmp_path: Path) -> None:
     assert got == ["why does a long prefill block other requests",
                    "traefik middlewares worth running",
                    "a bare topic trailing the list"], got
+
+
+def test_deep_dive_chain_edges_lead_to_the_same_judge(tmp_path: Path) -> None:
+    """The delegated brief joins the pipeline the research draft joins: the
+    owner ordering work buys attention at the judge, never a pass (§21)."""
+    c = cfg(tmp_path)
+    conn = db.connect(":memory:")
+    db.migrate(conn)
+    chain = chains.seed_deepdive(c, conn, "zfs arc explained")
+    head = conn.execute("SELECT * FROM tasks WHERE chain_id=?",
+                        (chain,)).fetchone()
+    assert head["kind"] == "delegate" and head["generator"] == "deep-dive"
+    assert "delegate" in chains.DRAFT_KINDS
+    made = chains.advance(c, conn, db.Task.from_row(head),
+                          result_text="# brief\n")
+    assert [t.kind for t in made] == ["critique"]
+    crit = conn.execute("SELECT * FROM tasks WHERE id=?",
+                        (made[0].id,)).fetchone()
+    nxt = chains.advance(c, conn, db.Task.from_row(crit))
+    assert [t.kind for t in nxt] == ["evaluate"]
+    ev = conn.execute("SELECT * FROM tasks WHERE id=?", (nxt[0].id,)).fetchone()
+    conn.execute("UPDATE tasks SET payload_json=json_set(payload_json,'$.verdict',"
+                 "'\"REJECT\"') WHERE id=?", (ev["id"],))
+    conn.commit()
+    ev_row = conn.execute("SELECT * FROM tasks WHERE id=?",
+                          (ev["id"],)).fetchone()
+    assert chains.advance(c, conn, db.Task.from_row(ev_row)) == [], \
+        "a rejected deep-dive gets no publish stage, same as everything else"

@@ -298,6 +298,15 @@ def _read_conn(cfg: Config) -> sqlite3.Connection:
     return conn
 
 
+def _json(raw: Any) -> dict[str, Any]:
+    """payload column to dict, forgivingly: a corrupt payload must not take
+    the counter down with it."""
+    try:
+        return json.loads(raw or "{}")
+    except Exception:
+        return {}
+
+
 def create_app(cfg: Config, kitchen: Any = None) -> FastAPI:
     """`kitchen=None` is a honest second-class mode, not a bug: the UI still
     renders the queue and plates it, but the gate panel says *stale*."""
@@ -579,6 +588,109 @@ def create_app(cfg: Config, kitchen: Any = None) -> FastAPI:
         text, code = await asyncio.to_thread(read)
         return PlainTextResponse(text or "", status_code=code,
                                  media_type="text/markdown; charset=utf-8")
+
+    @app.get("/api/orders")
+    async def api_orders() -> JSONResponse:
+        """Tickets at the counter: everything Sam has ordered, with the
+        stage each order has reached. A projection of tasks whose payload
+        says origin=sam — the queue is the order book, and this reads it."""
+        conn, own = conn_for()
+        try:
+            rows = conn.execute(
+                "SELECT id, chain_id, status, title, payload_json, score,"
+                " created_at FROM tasks"
+                " WHERE json_extract(payload_json, '$.origin') = 'sam'"
+                " ORDER BY created_at DESC LIMIT 50").fetchall()
+            orders = []
+            for r in rows:
+                prog = conn.execute(
+                    "SELECT COUNT(*) AS n,"
+                    " SUM(status IN ('SUCCEEDED','FAILED','REJECTED')) AS done"
+                    " FROM tasks WHERE chain_id=?", (r["chain_id"],)).fetchone()
+                orders.append({
+                    "id": str(r["id"]),
+                    "kind": str(_json(r["payload_json"]).get("order_kind")
+                              or "research"),
+                    "status": r["status"],
+                    "topic": str(_json(r["payload_json"]).get("topic")
+                                or r["title"]),
+                    "score": r["score"],
+                    "stages": int(prog["n"] or 0),
+                    "done": int(prog["done"] or 0),
+                    "when": time.strftime("%Y-%m-%d %H:%M",
+                                          time.localtime(float(r["created_at"]))),
+                })
+            return JSONResponse({"orders": orders})
+        finally:
+            if own:
+                conn.close()
+
+    @app.post("/api/orders")
+    async def api_orders_submit(request: Request) -> JSONResponse:
+        """Write an order. research chains the five-stage self-sourced way;
+        deep-dive delegates one opencode session. Both then face the same
+        judge — ordering a task buys it attention, never a pass.
+
+        Rate-limited by pending orders (429 with the count, not silence),
+        and the master pause is honoured here at the counter: an ordered
+        job does not unlock a closed kitchen."""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"ok": False, "error": "body must be json"},
+                                status_code=400)
+        kind = str(body.get("kind") or "research")
+        topic = str(body.get("topic") or "").strip()
+        if kind not in ("research", "deep-dive"):
+            return JSONResponse({"ok": False,
+                                 "error": "kind must be research or deep-dive"},
+                                status_code=400)
+        if not (8 <= len(topic) <= 200):
+            return JSONResponse({"ok": False,
+                                 "error": "topic must be 8-200 characters"},
+                                status_code=400)
+        conn, own = conn_for()
+        try:
+            note = db.is_paused(conn)
+            if note is not None:
+                return JSONResponse({"ok": False,
+                                     "error": f"kitchen paused: {note}"},
+                                    status_code=409)
+            cap = int(cfg.get("orders.max_pending", 3))
+            pending = int(conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE"
+                " json_extract(payload_json, '$.origin') = 'sam' AND status IN"
+                " ('QUEUED','RUNNING','PAUSED')").fetchone()[0])
+            if pending >= cap:
+                return JSONResponse({"ok": False,
+                                     "error": f"{pending} orders already pending "
+                                            f"(cap {cap}); some must finish first"},
+                                    status_code=429)
+            if kind == "research":
+                chain = chains.seed(cfg, conn, topic, source="order")
+                # stamp the head so the counter can find its own tickets:
+                # the research seed writes its own payload shape, and the
+                # order book reads one field — origin=sam — off the head.
+                head = conn.execute(
+                    "SELECT id FROM tasks WHERE chain_id=?"
+                    " AND parent_task_id IS NULL", (chain,)).fetchone()
+                if head:
+                    db.merge_payload(conn, str(head["id"]),
+                                    {"origin": "sam", "order_kind": "research"})
+            else:
+                chain = chains.seed_deepdive(cfg, conn, topic)
+                head = conn.execute(
+                    "SELECT id FROM tasks WHERE chain_id=?"
+                    " AND parent_task_id IS NULL", (chain,)).fetchone()
+                if head:
+                    db.merge_payload(conn, str(head["id"]),
+                                    {"order_kind": "deep-dive"})
+            db.emit(conn, "order.taken", message=f"{kind}: {topic[:90]}",
+                    data={"chain_id": chain, "kind": kind})
+            return JSONResponse({"ok": True, "chain_id": chain, "kind": kind})
+        finally:
+            if own:
+                conn.close()
 
     dist = Path(__file__).resolve().parents[2] / "web" / "dist"
     if dist.is_dir():

@@ -22,6 +22,8 @@ The primary interactive client is **OpenCode**.
 
 Cooker is a polite sidecar client. It must never wrap, intercept, or supersede OpenCode or omlx. It watches **what reaches the GPU** — the server's ledger first (§20), bytes as tripwire, both failing closed — and when the GPU is being asked for anything it drops its own requests and backs off so the interactive client has full use of the LLM. Hands on the keyboard, browsers, compiles: not the GPU's business, not the kitchen's either.
 
+*(Amended 2026-10-07, same owner: "please expose opencode as a tool that the cooker can work with: submitting prompts to opencode in the right directory, responding to its prompts when it asks questions." The prohibition was never *use* — it was *wrap*. Cooker now drives OpenCode through OpenCode's own documented HTTP API, opening **its own sessions** (visible in the session list, interruptible by anyone who sees them), in directories it owns, answered by policy, interrupted by the ledger like any other burn. It still never injects into anyone else's session, never intercepts traffic, never supersedes — the broker is still dead. §21.)*
+
 ---
 
 # 0. Discovery Before Implementation

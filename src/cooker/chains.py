@@ -59,7 +59,15 @@ FREE_KINDS = frozenset({"search", "fetch", "publish", "collect", "scan"})
 # model as much as `synthesize` does; leaving it out would have it refused as an
 # unknown kind, or worse, run as a free stage that quietly produced nothing.
 THINKING_KINDS = frozenset({"plan", "extract", "synthesize", "critique",
-                            "analyze", "consolidate", "write", "draft", "generate"})
+                            "analyze", "consolidate", "write", "draft",
+                            "generate",
+                            # `delegate` thinks too — through opencode's hands
+                            # on the same omlx. The ledger charges it like any
+                            # other burn; the only difference is whose socket it
+                            # travels on (§21). Leaving it out here would book a
+                            # GPU stage as free, which is the lie this set
+                            # exists to prevent.
+                            "delegate"})
 
 # The stage whose text *is* the artifact — exactly one per generator, read off
 # PLAN §5: research `synthesize`, project-review `analyze`, homelab-audit
@@ -70,7 +78,7 @@ THINKING_KINDS = frozenset({"plan", "extract", "synthesize", "critique",
 # every stage's file turned `artifacts` into a scratch index and made the digest
 # report twenty-one items for four chains' worth of stages.
 DRAFT_KINDS = frozenset({"synthesize", "analyze", "consolidate", "generate",
-                         "write", "draft"})
+                         "write", "draft", "delegate"})
 
 
 def slug(text: str, *, limit: int = 48) -> str:
@@ -267,6 +275,21 @@ def seed(cfg: Config, conn: sqlite3.Connection, topic: str,
     return chain
 
 
+def seed_deepdive(cfg: Config, conn: sqlite3.Connection, topic: str,
+                  *, priority: int = 400, origin: str = "sam") -> str:
+    """The head of a deep-dive chain: one delegated stage, queued with the
+    owner's own words as the topic. Orderers land here (§ orders). The
+    prompt itself is built by the runner at run time — the delegate's brief
+    belongs to the tool that issues it, not to the queue that remembers it.
+    """
+    chain = db.new_id()
+    db.create_task(conn, chain_id=chain, kind="delegate", generator="deep-dive",
+                   title=f"delegate: {topic[:110]}",
+                   payload={"topic": topic, "origin": origin}, priority=priority)
+    mark_seen(conn, topic_hash(topic), kind="topic", ref=chain)
+    return chain
+
+
 def seed_research_if_thirsty(cfg: Config, conn: sqlite3.Connection,
                               *, limit: int = 1) -> list[str]:
     """Self-refill: the queue's reason for existing.
@@ -362,10 +385,46 @@ def advance(cfg: Config, conn: sqlite3.Connection, task: db.Task,
     payload = dict(task.payload)
     made: list[db.Task] = []
 
+    if gen == "deep-dive":
+        # M9, live 2026-10-07: `delegate` drives opencode (its own session,
+        # in its own directory, over the server's documented basic-auth API)
+        # and hands the brief to the same critique→evaluate→publish tail the
+        # research chain uses. One delegation, one draft, one judgement —
+        # the pipeline's respect for the judge did not change with the hands.
+        if kind == "delegate":
+            made.append(db.create_task(
+                conn, chain_id=task.chain_id, kind="critique", generator=gen,
+                title=f"critique: {payload.get('topic', task.title)[:80]}",
+                parent_task_id=task.id, dependencies=[task.id], payload=payload))
+        elif kind == "critique":
+            made.append(db.create_task(
+                conn, chain_id=task.chain_id, kind="evaluate", generator=gen,
+                title=f"evaluate: {payload.get('topic', task.title)[:80]}",
+                parent_task_id=task.id, dependencies=[task.id], payload=payload))
+        elif kind == "evaluate":
+            verdict = str(payload.get("verdict") or "")
+            score = payload.get("score")
+            if verdict == "PUBLISH":
+                made.append(db.create_task(
+                    conn, chain_id=task.chain_id, kind="publish", generator=gen,
+                    title=f"publish: {payload.get('topic', task.title)[:80]}",
+                    parent_task_id=task.id, dependencies=[task.id],
+                    payload=payload))
+            else:
+                db.emit(conn, "chain.rejected",
+                        message=f"{payload.get('topic', task.title)[:70]} scored "
+                               f"{score} and was not published",
+                        data={"chain_id": task.chain_id, "task_id": task.id,
+                              "score": score, "verdict": verdict or "UNKNOWN"})
+        elif kind == "publish":
+            db.emit(conn, "chain.complete", message=f"{task.title[:80]}",
+                    data={"chain_id": task.chain_id, "task_id": task.id})
+        return made
+
     if gen != "research":
-        # M9's generators get their own edges. Saying so, rather than returning an
-        # empty list, is what makes "this chain went nowhere" a message instead of
-        # a mystery.
+        # The other generators still wait for their edges. Saying so, rather
+        # than returning an empty list, is what makes "this chain went
+        # nowhere" a message instead of a mystery.
         db.emit(conn, "chain.stub",
                 message=f"{gen}.{kind} has no edges yet (M9)",
                 data={"task_id": task.id})

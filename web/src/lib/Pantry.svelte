@@ -10,15 +10,15 @@
 
   let products = $state([]);
   let counts = $state({ published: 0, candidate: 0 });
-  let filter = $state('all');
+  let filter = $state('published');  // the good shelf first — served is what this kitchen is for
   let note = $state('opening the pantry…');
   let err = $state(false);
 
   const GEN_COLOR = { research: 'var(--cyan)', brainstorm: 'var(--amber)', digest: 'var(--green)' };
 
   const FILTERS = [
-    ['all', 'ALL'],
     ['published', '★ SERVED'],
+    ['all', 'ALL'],
     ['research', 'RESEARCH'],
     ['brainstorm', 'BRAINSTORM'],
   ];

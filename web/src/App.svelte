@@ -5,6 +5,7 @@
   import Pantry from './lib/Pantry.svelte';
   import Stats from './lib/Stats.svelte';
   import Guide from './lib/Guide.svelte';
+  import { renderMarkdown } from './lib/md.js';
 
   let tab = $state(localStorage.getItem('cooker.tab') || 'kitchen');
   let state = $state(null);
@@ -50,6 +51,12 @@
     } catch (e) {
       sseNote = 'offline';
     }
+  }
+
+  function onOrdered() {
+    refreshKey++;
+    refreshState();
+    refreshStats();
   }
 
   async function refreshStats() {
@@ -178,7 +185,7 @@
   </nav>
 
   {#if tab === 'kitchen'}
-    <Kitchen snap={state} {log} {serveFlash} {openArtifact} />
+    <Kitchen snap={state} {log} {serveFlash} {openArtifact} onOrdered={onOrdered} />
   {:else if tab === 'pantry'}
     <Pantry refreshKey={refreshKey} {openArtifact} {openDigest} />
   {:else if tab === 'stats'}
@@ -210,7 +217,7 @@
           <button onclick={() => { artifact = null; }}>close (esc)</button>
         </div>
       </div>
-      <pre class="md">{artifact.text}</pre>
+      <article class="md">{@html renderMarkdown(artifact.text)}</article>
     </section>
   </div>
 {/if}
@@ -241,13 +248,49 @@
     color: var(--ink);
     font: 13px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
   }
+  /* The rendered plate: a cream page on the dark table, serif-free but
+     calm, amber section heads like the brass rail. Content is sanitized
+     by lib/md.js before it gets here — structure only, no raw tags. */
   :global(.md) {
-    white-space: pre-wrap;
+    font: 13px/1.75 ui-monospace, "SF Mono", Menlo, monospace;
+    color: #2c2433;
+    background: var(--paper, #f2e7cf);
+    padding: 18px 20px;
+    border: 2px solid #cbb98f;
+    box-shadow: inset 0 0 0 1px #fff8e6, 0 2px 0 #16101e;
     word-break: break-word;
-    font: 12.5px/1.65 ui-monospace, "SF Mono", Menlo, monospace;
-    color: var(--cream);
-    margin: 0;
   }
+  :global(.md h3), :global(.md h4), :global(.md h5), :global(.md h6) {
+    font-family: "Press Start 2P", monospace;
+    color: #7a4f1d;
+    font-size: 10px;
+    letter-spacing: 0.5px;
+    margin: 18px 0 8px;
+    border-bottom: 1px dashed #cbb98f;
+    padding-bottom: 4px;
+  }
+  :global(.md p) { margin: 8px 0; }
+  :global(.md ul), :global(.md ol) { margin: 8px 0; padding-left: 20px; }
+  :global(.md li) { margin: 3px 0; }
+  :global(.md code) {
+    background: #e4d6b4; border: 1px solid #cbb98f;
+    padding: 0 3px; font-size: 12px; color: #5a3d12;
+  }
+  :global(.md pre.code) {
+    background: #241c2e; color: var(--cyan);
+    border: 2px solid #cbb98f; padding: 10px 12px;
+    overflow-x: auto; font-size: 11.5px; line-height: 1.6;
+  }
+  :global(.md blockquote) {
+    margin: 10px 0; padding: 6px 12px;
+    border-left: 4px solid var(--ember); color: #5c4a2e;
+    background: #ece0c2;
+  }
+  :global(.md a) { color: #0b6e8a; text-decoration: underline dotted; }
+  :global(.md hr) { border: none; border-top: 1px dashed #cbb98f; margin: 14px 0; }
+  :global(.md table) { border-collapse: collapse; margin: 10px 0; width: 100%; font-size: 12px; }
+  :global(.md th), :global(.md td) { border: 1px solid #cbb98f; padding: 4px 8px; text-align: left; }
+  :global(.md th) { background: #e4d6b4; }
   main {
     max-width: 1080px;
     margin: 0 auto;
@@ -350,7 +393,7 @@
     font: inherit; font-size: 11px; cursor: pointer; padding: 3px 8px;
   }
   .plate-actions button:hover { border-color: var(--amber); color: var(--amber); }
-  .plate pre { margin-top: 10px; }
+  .plate article.md { margin-top: 10px; }
   @media (max-width: 520px) {
     h1 { font-size: 12px; }
     .tab { font-size: 8px; padding: 7px 8px 6px; }

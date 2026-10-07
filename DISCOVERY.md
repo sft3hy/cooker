@@ -796,3 +796,84 @@ published rows carry NULL scores (§ pre-gate legacy); this one carries the stam
 The same afternoon's books: 159 research stages, 75,430 output tokens, 567 GPU
 seconds — then `topics.exhausted`: topics.md holds 16 subjects and the well ran
 dry in one working day. Production is now inventory-limited, not gate-limited.
+
+## §21 opencode as a tool — M9 by direct measurement (2026-10-07)
+
+Sam: *"expose opencode as a tool that the cooker can work with: submitting
+prompts to opencode in the right directory, responding to its prompts when it
+asks questions, and generally just be able to use the tool."* The deep-dive pot
+was a stub waiting for hands; these are the hands. Everything below was
+measured against **this box's** running build before a line of client code was
+written, because the docs site describes a future build and the running build
+disagrees where it matters.
+
+### The device, specifically
+
+- **Binary**: homebrew tap formula `opencode-v2` **v2.0.24** (Mach-O arm64;
+  the plain `opencode` formula at 2.0.20 is *not* installed).
+- **Server A** (the one Cooker drives): launchd `com.homelab.opencode`,
+  KeepAlive, `opencode serve --hostname 127.0.0.1 --port 4096` via
+  `~/homelab/edge/opencode/run-opencode.sh`, cwd `~/homelab`. Up since
+  Oct 5. **Auth is HTTP Basic on `/api/*`: username is always `opencode`,
+  password `OPENCODE_PASSWORD` from `~/homelab/edge/.env`** — the wrapper's
+  own comments document the design (stable across restarts so phone logins
+  don't break; the SPA shell loads anonymously; Traefik fronts it as
+  `https://opencode.home.arpa` through OrbStack's host loopback). `/openapi.json`
+  through that Basic is the authoritative contract for 2.0.24 — **117 paths**.
+- **Server B**: the auto-managed `opencode serve --service` (pid 23788,
+  **ephemeral port 49374**) that the TUI and `opencode api` discover. The
+  web UI at `/server/` is an SPA fallback returning HTML 200, not an API —
+  `curl /server/api/info` returns the shell, and only Basic opens `/api/*`.
+- **Shared DB**: both servers read `~/.local/share/opencode/opencode.db` —
+  sessions are visible to both, including the one this very report is being
+  written inside. The 1 active session on `/api/session/active` was me.
+- **Agents**: Build, General, Explore, Compaction, Title, Summary, Plan.
+  Model: `omlx/Qwen3.8-Flash-Next-oQ4e-mtp` from the global config — which
+  points at `100.122.197.81:8000/v1`, the tailnet address of the same omlx
+  the kitchen watches. Delegation spends the same GPU the gate protects; the
+  ledger charges it the same way, and Cooker subtracts exactly one `own` for
+  the one session whose id it minted.
+
+### The contract, as corrected by the running build
+
+| guess (from docs) | fact (2.0.24 live) |
+|---|---|
+| permission reply `{"response": …}` | **`{"decision": "once\|always\|reject"}`** — the wrong key rejects everything silently |
+| session/messages under `data.parts` | messages are **top-level `{type, content:[…]}`**; assistant text lives in `content[].type=="text"`, reasoning is a separate part that must not be collected |
+| busy-state polling | **`{type:"idle", outcome:"succeeded"}`** sentinel message is the completion oracle; `/api/session/active` is `{ses: {type:"running"}}` |
+| prompt `/api/session/{id}/prompt` | ✓ `{"text": …}` — but the **session's location directory must already exist**: create accepts missing dirs, prompt answers `LocationNotFoundError` |
+| form reply `{"answers": {…}}` | **`{"answer": {…}}`** |
+
+### The architecture it forced
+
+Cooker drives **Server A** directly over loopback Basic — not the CLI (a
+subprocess per call is the wrong shape for a daemon), not Server B (its port
+is ephemeral by design), never by injection into existing sessions. Credentials
+come from a ladder (`OPENCODE_PASSWORD` env → explicit file → the edge `.env`)
+and are never written into config.yaml or the plist — same discipline as every
+other key on this box.
+
+- **deep-dive chain**: `delegate → critique → evaluate → publish|reject` —
+  the delegated brief faces **the same judge** as every research draft.
+  Ordering work buys attention at the judge, never a pass (§ orders).
+- **permissions**: answered one at a time (`once`). The code **refuses the
+  `always` mode itself** — a saved permission outlives the stage that earned
+  it. A deny list (rm/sudo/git push/.env/.ssh/network-mutating curl…)
+  rejects first and beats every grant. Every answer is an event
+  (`opencode.permission`) — the kitchen's yes-men must be auditable.
+- **preemption**: the delegate stage is a GPU stage like any other. When the
+  ledger says someone else is generating, the stage is cancelled, the
+  session is **interrupted** (`POST /interrupt`), and the task takes the same
+  paused→recovered path the LLM stages use. The ledger cannot attribute
+  requests per client, so `own` subtracts exactly one for the one session id
+  we minted — Sam prompting simultaneously makes `active` outrun `own` and
+  preemption behaves exactly as §20 drew it.
+- **orders**: `POST /api/orders {topic, kind: research|deep-dive}`. Cap of
+  pending orders answers **429 with the number**, pause answers **409** —
+  the counter is honest about why it won't take the ticket. Tickets come back
+  with their stage progress.
+
+Live proof, same sitting: order taken 13:52, gate opened on the first 4-second
+gap (`start: slot0:deep-dive.delegate`), session created in the delegation
+workspace with the `.env` ladder password, permissions auto-tended by policy —
+numbers below.

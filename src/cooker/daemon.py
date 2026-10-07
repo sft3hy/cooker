@@ -24,6 +24,7 @@ from typing import Any
 
 from cooker import chains, db
 from cooker import llm as llm_mod
+from cooker import opencode as opencode_mod
 from cooker import runner as runner_mod
 from cooker.config import Config
 from cooker.detect import IDLE, Detector
@@ -44,8 +45,17 @@ class Kitchen:
         # needs the number so our own streaming stage does not read as "someone
         # else generating" and preempt itself; in dry-run it stays zero, which
         # is the truth: dry-run has nothing in flight and never will.
+        self.oc: opencode_mod.OpenCode | None = None
         self.detector = Detector(cfg, self.conn, clock=self.clock,
-                                  own_busy=lambda: self.llm.inflight if self.llm else 0)
+                                  own_busy=lambda: (
+                                      self.llm.inflight if self.llm else 0) + (
+                                      # A delegation burns the same GPU through
+                                      # opencode's hands; the ledger cannot tell
+                                      # whose request is whose, so we subtract the
+                                      # one session we know is ours (§21). When
+                                      # Sam prompts too, `active` outruns `own`
+                                      # again and preemption behaves normally.
+                                      1 if self.oc and self.oc.busy_session else 0))
         # The GPU client exists only when we are actually live. In dry-run there
         # is no LLM object at all, which is the strongest guarantee the code can
         # give: there is nothing here holding a connection to omlx to accidentally
@@ -54,7 +64,10 @@ class Kitchen:
         self.runner: runner_mod.StageRunner | None = None
         if not dry_run:
             self.llm = llm_mod.LLM(cfg, emit=self._emit)
-            self.runner = runner_mod.StageRunner(cfg, self.conn, self.llm)
+            if bool(cfg.get("opencode.enabled", True)):
+                self.oc = opencode_mod.OpenCode(cfg, emit=self._emit)
+            self.runner = runner_mod.StageRunner(cfg, self.conn, self.llm,
+                                                 oc=self.oc)
         self.scheduler = Scheduler(cfg, self.conn, self.detector, dry_run=dry_run,
                                    clock=self.clock,
                                    stage_runner=self.runner if self.runner else None)

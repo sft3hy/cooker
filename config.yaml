@@ -271,3 +271,29 @@ generators:
   brainstorm:    { enabled: true,  weight: 2 }
   creation:      { enabled: true,  weight: 1 }
   digest:        { enabled: true,  weight: 1 }
+
+# OpenCode as a tool (M9, 2026-10-07, owner's request): the deep-dive pot
+# delegates to Sam's opencode server through its documented loopback API.
+# Device facts (DISCOVERY §21): v2.0.24 launchd `com.homelab.opencode`,
+# HTTP Basic on :4096, username always "opencode". The password is never in
+# this file — it comes from OPENCODE_PASSWORD in the env or the edge stack's
+# .env, resolved by the ladder in opencode.py.
+opencode:
+  enabled: true
+  base_url: http://127.0.0.1:4096
+  agent: build
+  poll_seconds: 2.0
+  max_minutes: 12
+  # Permissions are answered one at a time. "always" is refused by the code
+  # no matter what is set here, because a saved permission outlives the
+  # stage that earned it.
+  auto_permission: once
+  form_default_answer: "Proceed read-only; keep outputs in the workspace."
+  # deny beats auto_permission: research never legitimately needs these.
+  # deny_patterns: []   # unset = the module's built-in list
+
+# Sam orders work at the counter (the Kitchen tab). Pending orders are capped
+# so a burst of typing cannot fill the queue: 429 is honest, a silent drop is
+# not.
+orders:
+  max_pending: 3

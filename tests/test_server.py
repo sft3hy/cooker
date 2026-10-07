@@ -255,3 +255,41 @@ def test_digest_endpoint(client):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("# today's menu\n")
     assert cl.get("/api/digest").text.startswith("# today's menu")
+
+
+def test_orders_counter_takes_research_and_deep_dives(client):
+    cl, _c, conn = client
+    r = cl.post("/api/orders", json={"topic": "why does zsh start slow",
+                                       "kind": "research"})
+    assert r.status_code == 200 and r.json()["ok"]
+    r2 = cl.post("/api/orders", json={"topic": "deep-dive: nas snapshot "
+                                                 "scheduling for dummies",
+                                        "kind": "deep-dive"})
+    assert r2.status_code == 200
+    kinds = {o["kind"] for o in cl.get("/api/orders").json()["orders"]}
+    assert kinds == {"research", "deep-dive"}
+    head = conn.execute("SELECT kind, generator FROM tasks ORDER BY priority,"
+                        " created_at LIMIT 4").fetchall()
+    assert ("delegate", "deep-dive") in [(h["kind"], h["generator"])
+                                           for h in head]
+
+
+def test_orders_are_validated_rate_limited_and_pause_respecting(client):
+    cl, _c, conn = client
+    assert cl.post("/api/orders", json={"topic": "short"}).status_code == 400
+    assert cl.post("/api/orders",
+                   json={"topic": "long enough to be a real subject",
+                        "kind": "podcasts"}).status_code == 400
+    for i in range(3):
+        assert cl.post("/api/orders",
+                       json={"topic": f"a subject worth researching {i}",
+                            "kind": "research"}).status_code == 200
+    fourth = cl.post("/api/orders",
+                     json={"topic": "a subject worth researching 99",
+                          "kind": "research"})
+    assert fourth.status_code == 429, "the counter caps pending orders loudly"
+    db.set_meta(conn, "paused", "sam is presenting")
+    blocked = cl.post("/api/orders",
+                      json={"topic": "approved after the pause lifts here",
+                           "kind": "deep-dive"})
+    assert blocked.status_code == 409, "an order never unlocks a closed kitchen"
