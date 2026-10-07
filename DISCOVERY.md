@@ -462,3 +462,71 @@ The general shape: **a readable file is a parsed file, and a parsed file will be
 fed to a GPU.** Anything a human can annotate in prose is a queue that can
 misinterpret its own documentation, so the parsed count has to be printed somewhere —
 that is why `status` says `topics 6` rather than nothing.
+
+## 16. The wire during a live agent session (M8, 2026-10-07)
+
+Two benches, run one after the other so neither measured the other.
+`bench11_wire_structure.py` (180s, read-only, no inference submitted) and
+`bench12_collision_live.py` (real inference, two clients: `cooker` and `human`).
+
+### The gap distribution — the number the whole design hangs on
+
+    179s trace: ACTIVE_INFER 117.3s (65.5%) · IDLE 58.9s (32.9%) · blind 4 ticks
+    19 quiet gaps bounded by traffic:
+      lengths (s): 2 ×11, 4 ×6, 5 ×2      median 2.2s   longest 5.2s
+
+    window   gaps usable   seconds   % of trace
+        2s            16          51      28.5%
+        4s             8          34      19.2%
+        6s             0           0       0.0%
+       60s             0           0       0.0%
+
+**While an agent session is running, the wire never goes quiet for six seconds.**
+Every gap is 2 to 5 seconds. So `idle_confirm_seconds: 60` does not merely delay
+cooking during a session, it forbids it: 0 of 179 seconds was cookable, and the
+daemon was blocked on all 180 ticks. That is the M8 blocker measured rather than
+described.
+
+It also bounds what a burst detector can win. A 4-second claim gate recovers 19% of
+a busy session; nothing recovers 60 seconds, because 60 seconds does not exist here.
+
+### The floor is thinner than the calibration suggested
+
+    served B/s: min 0  median 1,145  max 121,349
+    lowest busy 470 · floor 256 · highest quiet 99   separation clean
+
+bench #7 calibrated 0 B/s silence against 6,683 B/s generating, which made 256 look
+like it sat two orders of magnitude inside an empty space. Real traffic fills that
+space in: the lowest reading still classified busy was **470 B/s** and the highest
+still classified quiet was **99**. 256 still separates them, so the floor is correct,
+but the margin is ~2.6x rather than ~26x, and a generation that dribbles fewer than
+256 bytes in a 3s window reads as quiet. Worth a re-check with a slow-decoding
+workload before the floor is trusted to catch every generation.
+
+### Collisions are cheap — the assumption that was wrong
+
+    baseline ttft   n=4  median 100 ms  max 170 ms  (server's own number agrees)
+    collision ttft  n=4  median 195 ms  max 450 ms
+    median stall    +95 ms  (budget ±750 ms)
+    prefill race, human second: 450 ms
+    stage prefill 60-320 ms · 664 in / ~880 out in ~4,200 ms
+
+A probe fired 1.5s into a live Cooker stage cost the human **+200 ms**; the second
+large prefill in the device cost **+350 ms**. Against the 750 ms budget that is
+nothing. **The unbounded-gate premise was protecting against a harm that turns out
+to cost a fifth of a second.**
+
+The surprise is the stage length: 880 tokens in 4.0s is **~200 tok/s**, not the
+8 tok/s carried in earlier notes. The 8 figure was reasoning-mode on a large prompt
+and it had quietly become the planning number for everything. Stage sizing that
+assumed 20s stages is wrong by about 5x, which is exactly the difference between "a
+4-second gap can host a `plan` stage" and "nothing fits in a gap so don't try".
+
+### What this decides
+
+Politeness is not the constraint on short gaps — completion is. Starting a stage in a
+4-second gap costs the human ~100-350 ms and, at 200 tok/s, completes a stage sized
+to fit. So: shorten the claim gate, size the work to the silence actually observed,
+and let the 60-second window keep its original meaning as the gate for *concurrency*
+rather than for *anything at all*. The harm to retreat from is bytes on the wire,
+which is already the trigger, and the retreat is the part worth making faster.
