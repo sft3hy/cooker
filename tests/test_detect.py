@@ -28,6 +28,7 @@ from cooker.detect import (
     parse_conns,
     peer_summary,
 )
+from cooker.ledger import LedgerView
 from cooker.wire import DEAD, Wire
 
 PORT = 8000
@@ -250,12 +251,25 @@ def cfg(**over: object) -> Config:
             "infer_min_bps": 256,
             "wire_interval_seconds": 1.0,
             "wire_window_seconds": 3.0,
+            "ledger": {
+                "enabled": True,
+                "url_candidates": [],
+                "ca_file": None,
+                "admin_key_env": "COOKER_TEST_ADMIN_KEY",
+                "admin_key_file": None,
+                "interval_seconds": 1.0,
+                "request_timeout_seconds": 2.0,
+                "stale_seconds": 4.0,
+                "infer_margin_seconds": 5.0,
+            },
         },
         "scheduler": {"max_concurrency": 1},
     }
     for key, value in over.items():
         if key in base["detect"]:
             base["detect"][key] = value
+        elif key.startswith("ledger."):
+            base["detect"]["ledger"][key.split(".", 1)[1]] = value
         elif key in base["scheduler"]:
             base["scheduler"][key] = value
         else:
@@ -556,3 +570,141 @@ async def test_quiet_streaks_are_recorded_as_burst_structure() -> None:
     state = await d.tick()
     assert state.typical_gap_s == 5.0, "the snapshot carries it, so the runner need not"
     assert state.quiet_s is not None and state.quiet_s == 0.0
+
+
+# --- the ledger judge (§20) ------------------------------------------------
+#
+# The wire cannot tell a monitor's bytes from a generation's bytes, and has now
+# said so three separate times (§17's dashboard, §17's shape study, and the
+# 2/s /admin/api/stats metronome that walled the gate shut on 2026-10-07).
+# These tests pin the new judge: the server's ledger decides inference, bytes
+# only trip the wire inside the ledger's inference-memory window, and the whole
+# old byte regime runs untouched when the ledger is blind.
+
+def metronome(clk: Clock, bps: float = 12_557.0) -> Signals:
+    """Bytes on :8000 at the measured metronome rate (bench15: 12,557 B/s,
+    which is two 6.4 KB /admin/api/stats responses per second) — with an
+    explicitly idle ledger underneath them."""
+    sig = up(Signals(ts=clk.t, socks=connected()))
+    sig.wire = Wire(moved={SERVER: int(bps * WINDOW)}, window_s=WINDOW, ts=clk.t,
+                    up=True, samples=2)
+    return sig
+
+
+def with_ledger(sig: Signals, **kw: object) -> Signals:
+    """Stamp a live ledger read onto a signal. Defaults: server healthy and
+    genuinely idle — the state the bytes meter kept refusing to believe."""
+    kw.setdefault("idle_s", 60.0)
+    kw.setdefault("total_requests", 1426)
+    sig.ledger = LedgerView(ts=sig.ts, up=True, **kw)  # type: ignore[arg-type]
+    return sig
+
+
+@pytest.mark.asyncio
+async def test_the_metronome_cannot_wall_the_gate_anymore() -> None:
+    """The bug that killed every live run on 2026-10-07, pinned shut.
+
+    12.5 KB/s forever on :8000 — while the ledger says nobody is generating and
+    idle_seconds climbs. Old verdict: ACTIVE_INFER, forever, by construction.
+    New verdict: quiet, and after the (unchanged) 4s window the gate opens with
+    the metronome still running, because the server — the only party that knows
+    what a request was — says nothing was.
+    """
+    c, clk, sc = cfg(), Clock(), Scripted()
+    d = make(c, None, sc, clk)
+    sc.push(with_ledger(metronome(clk)))
+    state = await d.tick()
+    assert state.state == IDLE, state.reason
+    assert "monitor traffic" in state.reason, state.reason
+    assert not state.ready, "the first quiet tick is not yet four seconds"
+
+    for _ in range(4):
+        clk.advance(1)
+        sc.push(with_ledger(metronome(clk), idle_s=64.0 + 0.0))
+        state = await d.tick()
+    assert state.ready, f"four ledger-quiet seconds must open the gate: {state.blockers}"
+    assert state.ledger_up and state.ledger_idle_s is not None
+
+
+@pytest.mark.asyncio
+async def test_the_ledger_calls_inference_even_when_the_wire_says_quiet() -> None:
+    """The ledger is stricter, not looser: a request it counts is ACTIVE_INFER
+    even on a silent wire — a queued-but-not-yet-streaming generation is real,
+    and bytes-only would have missed it entirely."""
+    c, clk, sc = cfg(), Clock(), Scripted()
+    d = make(c, None, sc, clk)
+    sc.push(with_ledger(up(Signals(ts=clk.t)), active=1, waiting=2, idle_s=0.3))
+    state = await d.tick()
+    assert state.state == ACTIVE_INFER
+    assert "ledger" in state.reason and "queued" in state.reason, state.reason
+    assert not state.ready
+
+
+@pytest.mark.asyncio
+async def test_we_do_not_preempt_ourselves_reading_our_own_ledger() -> None:
+    """Our stage in flight reads as active=1 on the server. Without the own
+    subtraction the daemon would preempt itself every tick — which is exactly
+    how the pre-ledger daemon never survived a live stage at all."""
+    c, clk, sc = cfg(), Clock(), Scripted()
+    d = make(c, None, sc, clk)
+    sig = metronome(clk)  # our own streamed bytes, on the wire
+    sc.push(with_ledger(sig, active=1, own=1, idle_s=0.8))
+    state = await d.tick()
+    assert state.state != ACTIVE_INFER, "active=own is the kitchen cooking, not the human returning"
+    assert state.ledger_own == 1
+
+
+@pytest.mark.asyncio
+async def test_bytes_the_ledger_just_reset_are_inference_not_noise() -> None:
+    """A 0.26s completion (bench15) never lights the counters, but it resets
+    idle_seconds, and bytes with a freshly-reset clock are the request the
+    counters missed. Inside the margin: inference. The metronome never resets
+    the clock, so this catches the miss without resurrecting the wall."""
+    c, clk, sc = cfg(), Clock(), Scripted()
+    d = make(c, None, sc, clk)
+    sc.push(with_ledger(metronome(clk), idle_s=1.2))
+    state = await d.tick()
+    assert state.state == ACTIVE_INFER, state.reason
+    assert "active 1.2s ago" in state.reason, state.reason
+
+
+@pytest.mark.asyncio
+async def test_the_reset_window_has_an_edge() -> None:
+    """Outside the margin the same bytes are monitors again — the window exists
+    for the missed completion, not as a second byte wall. Configurable knob,
+    tested on both sides of its own number."""
+    c, clk, sc = cfg(**{"ledger.infer_margin_seconds": 5.0}), Clock(), Scripted()
+    d = make(c, None, sc, clk)
+    sc.push(with_ledger(metronome(clk), idle_s=6.0))
+    state = await d.tick()
+    assert state.state == IDLE and "monitor" in state.reason, state.reason
+
+
+@pytest.mark.asyncio
+async def test_a_typing_human_outranks_monitor_traffic() -> None:
+    """Order of judges: the ledger's 'nobody is generating' is not 'nobody is
+    coming back'. HID evidence still outranks the calmest ledger, because the
+    gate is about what happens next, not only about what is happening now."""
+    c, clk, sc = cfg(), Clock(), Scripted()
+    d = make(c, None, sc, clk)
+    sig = with_ledger(metronome(clk))
+    sig.hid_idle_s = 3.0
+    sc.push(sig)
+    state = await d.tick()
+    assert state.state == ACTIVE_USER, state.reason
+    assert not state.ready
+
+
+@pytest.mark.asyncio
+async def test_stale_ledger_falls_back_to_the_old_byte_judge() -> None:
+    """When we cannot ask the server, bytes are the trigger again — unchanged,
+    safety-first. This test is the fallback, verbatim: same bytes as the
+    metronome, ledger up=False, and the verdict must be the pre-§20 one."""
+    c, clk, sc = cfg(), Clock(), Scripted()
+    d = make(c, None, sc, clk)
+    sig = metronome(clk)  # ledger stays DEAD_LEDGER — blind
+    sc.push(sig)
+    state = await d.tick()
+    assert state.state == ACTIVE_INFER, "blind + bytes = the old honest panic"
+    assert "omlx serving" in state.reason
+    assert not state.ledger_up

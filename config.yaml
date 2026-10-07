@@ -36,6 +36,9 @@ detect:
     # Reading the wire is a dict lookup: the cost is paid once, by the resident
     # nettop, so this rides the tick cadence rather than a slow lane.
     wire: 1.0
+    # The ledger poll is a real GET, paid per poll; it beats the wire by a
+    # second on "is anyone generating", which is the whole reason it exists.
+    ledger: 1.0
   fs_roots:
     - ~/dev
     - ~/homelab
@@ -79,6 +82,30 @@ detect:
   # Measured cost when it is wrong: +95ms median, +200ms into a live decode, +350ms
   # for a second large prefill, against a 750ms budget.
   claim_quiet_seconds: 4.0
+  # --- the ledger: what omlx says about its own bus (§20, bench15) ----------
+  # Bytes are honest about moving and silent about *why*. The server's admin
+  # ledger answers why: `total_active_requests`/`idle_seconds` count inference
+  # and nothing else — measured, while the /admin/api/stats metronome hammered
+  # :8000 at 2/s (12.5 KB/s), the ledger sat at active=0 with idle_seconds
+  # climbing, and one real 0.26s completion moved total_requests. So when the
+  # ledger is up it is the judge and bytes are the tripwire; when it is blind
+  # the bytes judge, unchanged, safety-first. Polling it is not load worth
+  # fearing: one ~6 KB GET per second, 5–8 ms of the server's event loop —
+  # the same traffic the dashboards already generate, but now *explained*.
+  ledger:
+    enabled: true
+    url_candidates:                     # https/proxy first, raw tailnet next,
+      - https://omlx.home.arpa        # never loopback: shadowed by the stray
+      - http://100.122.197.81:8000   # http.server (§6, landmine 6)
+    ca_file: ~/homelab/edge/step/certs/root_ca.crt
+    admin_key_env: AR_OMLX_ADMIN_KEY  # env first, then api_key_file, like the
+    admin_key_file: ~/dev/autoresearch-service/.env   # inference key ladder
+    interval_seconds: 1.0              # poll cadence; the wire notices in ~2s,
+                                       # the ledger in ~1s, which is the point
+    request_timeout_seconds: 2.0
+    stale_seconds: 4.0                # older than this => blind, bytes judge
+    infer_margin_seconds: 5.0         # unexplained bytes + idle under this =>
+                                      # a generation the live counters just missed
   user_idle_seconds: 120        # HID quieter than this => not ACTIVE_USER
   opencode_wal_seconds: 30      # WAL touched within this => ACTIVE_USER
   fs_activity_seconds: 60       # a file saved within this => ACTIVE_USER

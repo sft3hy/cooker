@@ -44,6 +44,7 @@ from typing import Any, Protocol
 
 from cooker import db
 from cooker.config import Config
+from cooker.ledger import DEAD_LEDGER, LedgerProbe, LedgerView
 from cooker.wire import DEAD, Wire, WireProbe
 
 IDLE = "IDLE"
@@ -245,6 +246,9 @@ class Signals:
     # has gone stale, and then `clients` cannot be read as generating OR as idle:
     # the detector has to stop and say so instead of picking the hopeful one.
     wire: Wire = DEAD
+    # The server's own account (§20). `ledger.up` False means we could not ask,
+    # and then bytes are the judge again — the fallback, not the assumption.
+    ledger: LedgerView = DEAD_LEDGER
     cost_ms: dict[str, float] = field(default_factory=dict)
     failed: tuple[str, ...] = ()
 
@@ -297,6 +301,7 @@ class LiveSampler:
         *,
         clock: Callable[[], float] = time.time,
         our_pid: int | None = None,
+        own_busy: Callable[[], int] | None = None,
     ) -> None:
         self.cfg = cfg
         self.clock = clock
@@ -310,6 +315,11 @@ class LiveSampler:
         self.fs_roots = [Path(str(p)) for p in cfg.get("detect.fs_roots", ["~/dev", "~/homelab"])]
         self.load_names = tuple(cfg.get("detect.load_proc_names", ["omlx", "opencode"]))
         self.floor_bps = float(cfg.get("detect.infer_min_bps", 256))
+        # The ledger probe: one small GET per interval against the server's own
+        # admin API (§20). `own_busy` is our in-flight count, subtracted so we
+        # do not preempt ourselves reading our own completion.
+        self.ledger = LedgerProbe(cfg, clock=clock, own_busy=own_busy)
+        self.ledger_enabled = bool(cfg.get("detect.ledger.enabled", True))
         # Resident, not per-tick: nettop counts cumulatively, so a fresh process
         # each second has no earlier sample to diff and would answer "0 bytes"
         # forever. One long-lived reader, and `sample` just reads its dict.
@@ -336,6 +346,14 @@ class LiveSampler:
             # nettop, not per read, so it rides the tick by default.
             "wire": float(cad.get("wire", tick)),
         }
+        # The ledger poll is a real network call, so it rides its own measured
+        # cadence, not the generic tick — and when it is switched off the lane
+        # disappears rather than returning dead: no lane, no `ledger` key in
+        # `vals`, and `detect` falls back to bytes as if it were blind, which
+        # is the same safety posture and the one the config already describes.
+        if self.ledger_enabled:
+            self.cadence["ledger"] = float(
+                cad.get("ledger", self.ledger.interval))
         self.lsof_timeout = float(cfg.get("detect.lsof_command_timeout_seconds", 2.0))
         self.hid_timeout = float(cfg.get("detect.hid_idle_command_timeout_seconds", 2.0))
         self._last_run: dict[str, float] = {}
@@ -356,6 +374,8 @@ class LiveSampler:
             # In-process dict read, so it can run every tick for free.
             "wire": self.wire.snapshot,
         }
+        if self.ledger_enabled:
+            self.fns["ledger"] = self._ledger_poll
 
     def start(self) -> bool:
         """Bring up the reader. The daemon calls this, not `sample`: a probe
@@ -364,6 +384,8 @@ class LiveSampler:
 
     def stop(self) -> None:
         self.wire.stop()
+        if self.ledger_enabled:
+            self.ledger.aclose()
 
     def _due(self, name: str, now: float) -> bool:
         return now - self._last_run.get(name, float("-inf")) >= self.cadence[name]
@@ -473,6 +495,15 @@ class LiveSampler:
                     sums[name] = sums.get(name, 0.0) + cpu
         return tuple(sorted(sums.items(), key=lambda kv: -kv[1]))
 
+    def _ledger_poll(self) -> LedgerView:
+        """Poll the server and hand back what it says, freshness-flagged.
+
+        The poll never raises (see ledger.py); the freshness flag is applied on
+        the way out so a stale last-good read cannot be mistaken for news just
+        because it came back from the probe without an exception."""
+        self.ledger.poll()
+        return self.ledger.view()
+
     async def sample(self, prev: Signals | None = None) -> Signals:
         """Refresh whatever is due, concurrently, off the event loop.
 
@@ -520,6 +551,9 @@ class LiveSampler:
             ts=now,
             socks=socks,
             wire=wire if wire is not None else DEAD,
+            # Read fresh every tick regardless of when the poll last ran: the
+            # staleness flag is a function of the clock, and `view()` is free.
+            ledger=self.ledger.view() if self.ledger_enabled else DEAD_LEDGER,
             hid_idle_s=self.vals.get("hid"),
             oc_wal_age_s=self.vals.get("wal"),
             oc_clients=self.vals.get("oc_socks", ()),
@@ -569,6 +603,14 @@ class BusState:
     # payload it already has, and stage sizing needs the number at claim time, when
     # the detector object is not in scope in the runner.
     typical_gap_s: float | None = None
+    # The server's own ledger, surfaced verbatim (§20): `ledger_up` False means
+    # the detector fell back to bytes, and the UI has to be able to show that
+    # difference — "the box is idle" and "we had to guess from bytes" are
+    # different sentences.
+    ledger_up: bool = False
+    ledger_idle_s: float | None = None
+    ledger_active: int = 0
+    ledger_own: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -586,6 +628,11 @@ class BusState:
             "ramp_note": self.ramp_note,
             "typical_gap_s": (round(self.typical_gap_s, 1)
                               if self.typical_gap_s is not None else None),
+            "ledger_up": self.ledger_up,
+            "ledger_idle_s": (round(self.ledger_idle_s, 1)
+                              if self.ledger_idle_s is not None else None),
+            "ledger_active": self.ledger_active,
+            "ledger_own": self.ledger_own,
         }
 
 
@@ -604,10 +651,11 @@ class Detector:
         *,
         sampler: Sampler | None = None,
         clock: Callable[[], float] = time.time,
+        own_busy: Callable[[], int] | None = None,
     ) -> None:
         self.cfg = cfg
         self.conn = conn
-        self.sampler = sampler or LiveSampler(cfg, clock=clock)
+        self.sampler = sampler or LiveSampler(cfg, clock=clock, own_busy=own_busy)
         self.clock = clock
         self.tick_seconds = float(cfg.get("detect.interval_seconds", 1.0))
         self.user_idle = float(cfg.get("detect.user_idle_seconds", 120))
@@ -624,6 +672,13 @@ class Detector:
         # the detector could not have observed.
         self.claim_quiet = float(cfg.get("detect.claim_quiet_seconds", 4.0))
         self.floor_bps = float(cfg.get("detect.infer_min_bps", 256))
+        # How long after a completion the ledger still calls the model "recently
+        # active" when unexplained bytes are on the wire: a poll interval's
+        # worth of benefit of the doubt for the request the counters missed
+        # (bench15: a 0.26s completion is invisible to `active` but resets
+        # `idle_seconds`). Monitors never reset that clock, so this window is
+        # inference memory, not poll memory.
+        self.infer_margin = float(cfg.get("detect.ledger.infer_margin_seconds", 5.0))
         self.state = IDLE
         self.reason = "startup"
         self.signals = Signals()
@@ -667,7 +722,18 @@ class Detector:
         return ev
 
     def _classify(self, sig: Signals) -> tuple[str, str]:
-        """Strictest wins: inference > user > idle."""
+        """Strictest wins: inference > user > idle.
+
+        Two judges, in a deliberate order (§20). When the ledger is *up*, the
+        server answers for itself: inference is happening iff it says somebody
+        else is active or queued, or bytes moved while its own `idle_seconds`
+        says the model was busy moments ago (the short request the counters
+        miss). Bytes that the ledger does not explain as a generation are
+        monitors — metronomes at any cadence — and monitors do not close the
+        gate. When the ledger is *blind* the old judge runs, unchanged and
+        safety-first: bytes are the trigger again, because unexplained bytes
+        while deaf are exactly what we must not cook over.
+        """
         failed = set(sig.failed)
         if not sig.omlx_up and "sockets" not in failed:
             # Nothing listening: not busy, but there is also nothing to cook for.
@@ -677,25 +743,55 @@ class Detector:
             return ACTIVE_USER, "blind: lsof failed"
         clients = sig.socks.clients if sig.socks else ()
         servers = sig.socks.server_pids if sig.socks else ()
-        if sig.wire.server_talking(servers, self.floor_bps):
-            # The server itself is answering: the primary trigger, and it
-            # deliberately does not ask who. On this box the peer named on the
-            # socket is OrbStack rather than the real client, so blaming a process
-            # by name would be a guess, while bytes leaving omlx is a fact.
-            # Measured: 0 B/s idle against 10,752 B in a 2s window generating.
-            return ACTIVE_INFER, f"omlx serving {sig.wire.served_bps(servers):,.0f} B/s"
-        if clients:
-            # Someone is connected and moving nothing. Two readings, and they are
-            # not the same: if we can see the wire it is a keepalive, so the
-            # kitchen may light; if we cannot see the wire we simply do not know,
-            # and not-knowing stops new work without killing work in flight.
-            if not sig.wire.up:
-                return ACTIVE_USER, "blind: no throughput data, cannot tell 0 from unknown"
-            return IDLE, f"keepalive: {peer_summary(clients)}"
+        led = sig.ledger
+        note = ""
+        if led.up:
+            if led.others_busy:
+                return ACTIVE_INFER, (
+                    f"omlx serving {led.active} request(s) (ledger"
+                    + (f", {led.waiting} queued" if led.waiting else "") + ")")
+            talking = sig.wire.up and sig.wire.server_talking(servers, self.floor_bps)
+            if talking and led.idle_s is not None and led.idle_s < self.infer_margin:
+                if led.own > 0:
+                    # Our own stream explains the bytes and the server names
+                    # nobody else: keep cooking. A sub-second interactive burst
+                    # hiding in here is the measured +95ms we already budgeted
+                    # (§16); the queue check and active-minus-own catch
+                    # everything longer, one poll later.
+                    note = f"cooking: ours, {sig.wire.served_bps(servers):,.0f} B/s"
+                else:
+                    # Bytes on the wire the ledger shows no *current* request for,
+                    # inside the window in which a finished request would still have
+                    # reset the server's idle clock: a short generation the live
+                    # counters missed. Trust the reset; a monitor never moves it.
+                    return ACTIVE_INFER, f"model active {led.idle_s:.1f}s ago (ledger)"
+            if talking:
+                # Bytes the ledger refuses to call a generation. Not busy — but
+                # the reason has to say what those bytes were, or the next
+                # reader of the log re-litigates §17 from scratch.
+                note = (f"monitor traffic: {sig.wire.served_bps(servers):,.0f} B/s,"
+                      " ledger idle")
+            elif led.idle_s is not None:
+                note = f"quiet (server idle {led.idle_s:.0f}s)"
+        else:
+            if sig.wire.server_talking(servers, self.floor_bps):
+                # The server itself is answering: the fallback judge while the
+                # ledger is blind, unchanged from §16 and safety-first: bytes
+                # leaving omlx, unexplained, are a generation until proven not.
+                # Measured: 0 B/s idle against 10,752 B in a 2s window generating.
+                return ACTIVE_INFER, f"omlx serving {sig.wire.served_bps(servers):,.0f} B/s"
+            if clients:
+                # Someone is connected and moving nothing. Two readings, and they are
+                # not the same: if we can see the wire it is a keepalive, so the
+                # kitchen may light; if we cannot see the wire we simply do not know,
+                # and not-knowing stops new work without killing work in flight.
+                if not sig.wire.up:
+                    return ACTIVE_USER, "blind: no throughput data, cannot tell 0 from unknown"
+                return IDLE, f"keepalive: {peer_summary(clients)}"
         ev = self._user_evidence(sig)
         if ev:
             return ACTIVE_USER, " · ".join(ev)
-        return IDLE, "quiet"
+        return IDLE, note or "quiet"
 
     # --- the tick ---
 
@@ -795,6 +891,10 @@ class Detector:
             quiet_s=quiet_s,
             ramp_note="; ".join(ramp) if not ramped else "",
             typical_gap_s=self.typical_gap_s,
+            ledger_up=sig.ledger.up,
+            ledger_idle_s=sig.ledger.idle_s,
+            ledger_active=sig.ledger.active,
+            ledger_own=sig.ledger.own,
         )
 
     def _event(self, type_: str, message: str, *, severity: str, data: dict) -> None:

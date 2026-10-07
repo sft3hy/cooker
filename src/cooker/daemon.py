@@ -39,7 +39,13 @@ class Kitchen:
         self.conn = conn if conn is not None else db.connect(cfg.db_path)
         self._owns_conn = conn is None
         self.clock = time.time
-        self.detector = Detector(cfg, self.conn, clock=self.clock)
+        # `own_busy` is a lazy lambda because the GPU client does not exist
+        # yet in dry-run — and in dry-run it must keep not existing. The ledger
+        # needs the number so our own streaming stage does not read as "someone
+        # else generating" and preempt itself; in dry-run it stays zero, which
+        # is the truth: dry-run has nothing in flight and never will.
+        self.detector = Detector(cfg, self.conn, clock=self.clock,
+                                  own_busy=lambda: self.llm.inflight if self.llm else 0)
         # The GPU client exists only when we are actually live. In dry-run there
         # is no LLM object at all, which is the strongest guarantee the code can
         # give: there is nothing here holding a connection to omlx to accidentally
