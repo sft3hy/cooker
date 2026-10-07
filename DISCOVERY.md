@@ -989,3 +989,35 @@ The rule now, in code (`runner.project_home`):
 The stranded meal-planner was moved out whole (its one commit intact) to
 `~/dev/hobby/meal-planner`, the 52 MB sandbox was swept, and the shelf is
 paper again.
+
+
+## §23 the delegation's project went live — plans.home.arpa (2026-10-07)
+
+The meal-planner the first build-mode deep-dive designed is now a real
+service on the edge, end to end:
+
+- **repo**: `~/dev/hobby/meal-planner` (moved out of the freezer per §22,
+  its history intact);
+- **container**: `menu-board` (caddy, edge-network only, no host port — the
+  LAN sees exactly one front door, Traefik's); its Caddyfile earns its
+  keep: the feed arrives `text/calendar` with **55 CRLF line endings and
+  zero bare LFs** — RFC-5545-clean, imports into Apple/Google Calendar;
+- **TLS**: `plans.home.arpa` cert issued by the house step-ca. The first
+  validations failed *because of my own DNS restart window* — the ACME
+  challenge tripped over the resolver mid-flight; the record notes it
+  plainly: when you edit DNS and mint certs in the same minute, sequence
+  them, don't race them;
+- **DNS**: `plans.home.arpa → 100.122.197.81` in the Pi-hole's live
+  `dns.hosts` (edited while FTL was stopped — FTL rewrites its config on
+  graceful exit, so the only safe moment to edit that file by hand is when
+  it is not running; kill, edit, start);
+- **dashboard**: tile 19 on status.home.arpa — UP, 12ms, with the line
+  "week.ics feeds family calendars · served by cooker deep-dive delegation".
+
+What this proved: the pipeline's far end — order → delegate → critique →
+judge → *shipped service* — is real. A sentence typed at a counter became a
+calendar that phones can subscribe to. What it did not change: the edge
+repo's commit is the owner's (his working tree had uncommitted work in it;
+the four edited files are listed in the commit that cites this section),
+and the commandment that the kitchen designs hookups but the owner waves
+them through still stands — he said Go.

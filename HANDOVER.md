@@ -304,6 +304,12 @@ other. `bench11` is read-only; `bench12` asserts its own decision threshold (+75
    run, judged, and the first publish with a score ≥ 3.5 the quality loop actually
    earned. If the kitchen stayed cold on a night nobody used the GPU, the ledger
    judge — not the gate — is the suspect, in that order.
+2b. **The first delegation-built service is live**: `plans.home.arpa` —
+   repo `~/dev/hobby/meal-planner`, container `menu-board` (edge network, no
+   host port), cert by step-ca, DNS in pihole `dns.hosts`, tile on the
+   dashboard (§23). To change the menu: edit `plan/*.md` in the repo, run
+   `bash scripts/make-ics.sh`, the board serves it live — no redeploy.
+
 2. **Order something** — the counter is live (§21): the Kitchen tab takes a topic and
    a kind, or from the shell:
    `curl -X POST localhost:8256/api/orders -H 'content-type: application/json'
