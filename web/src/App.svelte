@@ -17,6 +17,10 @@
   let pollTimer = null;
   let bubbleTimer = null;
   let raf = 0;
+  // serveFlash: real events (published / digest) light the celebration for
+  // 2.8s. It is driven off the event stream, never off a timer of its own —
+  // a kitchen that congratulates itself on a schedule is a lie with confetti.
+  let serveFlash = $state({ until: 0, kind: '' });
 
   const HEAT = { filling: 1, simmer: 1, boiling: 1 };
 
@@ -40,6 +44,11 @@
     if (d.type === 'runner.published' || d.type === 'chain.complete'
         || d.type === 'runner.rejected' || d.type === 'digest.written'
         || d.type === 'llm.abort' || d.type === 'runner.cancelled') refreshState();
+    if (d.type === 'runner.published' || d.type === 'chain.complete') {
+      serveFlash = { until: Date.now() + 2800, kind: 'plate' };
+    } else if (d.type === 'digest.written') {
+      serveFlash = { until: Date.now() + 2800, kind: 'digest' };
+    }
     sfxFor(d.type);
   }
 
@@ -93,11 +102,16 @@
       pots: state.pots,
       state: g.stale ? 'OFFLINE?' : g.state,
       busy: busy || g.state === 'ACTIVE_INFER',
+      ready: !!(g.ready && !busy && !g.stale),
       banner,
       note: (g.reason || '').slice(0, 46),
       digestWritten: state.digest?.written,
       platedToday: state.today?.published ?? 0,
       dryRun: state.workers?.dry_run,
+      onAir: !g.stale && !!((state.workers?.slots || []).length || running),
+      tokensToday: (state.today?.input_tokens ?? 0) + (state.today?.output_tokens ?? 0),
+      flashUntil: serveFlash.until,
+      flashKind: serveFlash.kind,
     };
   }
 
@@ -192,7 +206,7 @@
 
 <main>
   <header>
-    <h1>cooker</h1>
+    <h1><span class="star" aria-hidden="true">★</span> cooker</h1>
     <span class="conn" class:live={sseNote === 'live'}>{sseNote}</span>
     <button class="mute" onclick={toggleMute} aria-label="toggle sound">
       {muted ? '♪ off' : '♪ on'}
@@ -200,14 +214,20 @@
   </header>
 
   <section class="scene" bind:this={wrap}>
-    <canvas
-      bind:this={canvas}
-      width={W}
-      height={H}
-      style="width:{W * scale}px; height:{H * scale}px;"
-      onclick={onClick}
-      aria-label="pixel kitchen: six burners, one per generator — click a pot to inspect it"
-    ></canvas>
+    <div class="tv">
+      <canvas
+        bind:this={canvas}
+        width={W}
+        height={H}
+        style="width:{W * scale}px; height:{H * scale}px;"
+        onclick={onClick}
+        aria-label="pixel kitchen: six burners, one per generator — click a pot to inspect it"
+      ></canvas>
+      <!-- CRT scanlines + vignette: pure decoration, pointer-events none,
+           and it lives on TOP of the canvas so it never touches the logical
+           pixels — the integers underneath stay integers. -->
+      <div class="scan" aria-hidden="true"></div>
+    </div>
   </section>
 
   <section class="hud">
@@ -345,6 +365,21 @@
     cursor: pointer;
   }
   .scene { text-align: center; margin: 6px 0 10px; }
+  .tv { position: relative; display: inline-block; line-height: 0; }
+  .scan {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(ellipse at center, transparent 62%, rgba(8, 4, 14, 0.38) 100%),
+      repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.20) 0 1px, transparent 1px 3px);
+    mix-blend-mode: multiply;
+  }
+  .star {
+    color: var(--amber);
+    animation: blink 1.1s steps(2, jump-none) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0.15; } }
   canvas {
     image-rendering: pixelated;
     image-rendering: crisp-edges;

@@ -103,7 +103,35 @@ function drawRoom(ctx, st, t) {
       px(ctx, rx, ry, PAL.steam);
       px(ctx, rx, ry + 2, PAL.steam);
     }
+    // stars twinkle between the drops — a night with stars is still a night
+    for (let i = 0; i < 9; i++) {
+      if ((t * 2 + i) % 3 < 1.4) {
+        px(ctx, 32 + ((i * 23 + 7) % 104), 27 + ((i * 11) % 14), PAL.cream);
+      }
+    }
+    // one shooting star every 11 seconds, because arcades deserve luck too
+    const p = t % 11;
+    if (p < 0.9) {
+      const sx = 32 + p * 118;
+      const sy = 28 + p * 9;
+      px(ctx, sx, sy, PAL.emberHot);
+      px(ctx, sx - 2, sy - 1, PAL.cream);
+      px(ctx, sx - 4, sy - 2, '#8a7f9a');
+    }
   }
+
+  // the diner sign: OPEN when the kitchen may light, CLOSED when it may not.
+  // Swings slightly. The gate's yes/no, hanging where a customer can see it.
+  const open = st.ready && !busy;
+  const swing = Math.round(Math.sin(t * 1.4) * 1.4);
+  px(ctx, 150, 88, PAL.metalDark);
+  px(ctx, 150, 89, PAL.metalDark);
+  const sx0 = 136 + swing;
+  rect(ctx, sx0, 90, 30, 12, PAL.ink);
+  rect(ctx, sx0, 90, 30, 1, PAL.metalDark);
+  const signOn = open || (t % 1) < 0.55;   // CLOSED blinks, like real neon
+  text(ctx, open ? 'OPEN' : 'CLOSED', sx0 + 3, 99,
+       signOn ? (open ? PAL.green : PAL.red) : '#5a2430', 8);
 
   // Wall clock with a seconds hand that actually ticks: proof the page is
   // alive without a spinner.
@@ -306,15 +334,45 @@ function drawPot(ctx, pot, b, t, events) {
 function drawHUDStrip(ctx, st) {
   // Top strip: bus state badge + what the badge *means*, verbatim from the
   // gate. The blockers are shown verbatim because paraphrase is where UI
-  // lies creep in.
+  // lies creep in. The score on the right is arcade-styled but honest: it
+  // is tokens actually cooked today, zero-padded like a high score, because
+  // tokens are the only currency this kitchen has.
   rect(ctx, 0, 0, W, 12, PAL.ink);
   const badge = st.state || 'OFFLINE';
   const c = badge === 'IDLE' ? PAL.green : badge === 'ACTIVE_INFER' ? PAL.red
     : badge === 'ACTIVE_USER' ? PAL.amber : PAL.dim;
   rect(ctx, 2, 2, 8, 8, c);
   text(ctx, badge, 14, 9, PAL.text, 8);
-  if (st.note) text(ctx, st.note.slice(0, 46), 150, 9, PAL.dim, 8);
-  if (st.dryRun) text(ctx, 'dry-run', 92, 9, PAL.amber, 8);
+  // ON AIR: blinks while the daemon actually holds a stage
+  if (st.onAir) {
+    const lit = (performance.now() / 500) % 2 < 1;
+    rect(ctx, 92, 2, 4, 8, lit ? PAL.red : '#5a2430');
+    text(ctx, 'AIR', 98, 9, lit ? PAL.red : '#5a2430', 8);
+  }
+  if (st.dryRun) text(ctx, 'dry-run', 128, 9, PAL.amber, 8);
+  if (st.note) text(ctx, st.note.slice(0, 24), 150, 9, PAL.dim, 8);
+  const score = String(Math.max(0, Math.round(st.tokensToday || 0)));
+  const pad = '0'.repeat(Math.max(0, 7 - score.length));
+  text(ctx, `SCORE ${pad}${score}`, 330, 9, PAL.amber, 8);
+}
+
+function drawServeCelebration(ctx, st, t) {
+  // PLATE SERVED — confetti + ribbon, ~2.8s, fired by real events
+  // (runner.published / chain.complete / digest.written). The confetti is
+  // deterministic-per-frame, not random: same instant, same picture, and a
+  // celebration that never allocates is a celebration that never janks.
+  const colors = [PAL.emberHot, PAL.cream, PAL.flame, PAL.steam, PAL.amber];
+  for (let i = 0; i < 26; i++) {
+    const cx = (i * 37 + Math.round(t * 90)) % W;
+    const cy = (i * 53 + Math.round(t * 150)) % 150;
+    ctx.fillStyle = colors[i % colors.length];
+    ctx.fillRect(cx, cy, 2, 2);
+  }
+  rect(ctx, 132, 118, 216, 18, PAL.ink);
+  rect(ctx, 132, 118, 216, 1, PAL.amber);
+  rect(ctx, 132, 135, 216, 1, PAL.amber);
+  const word = st.flashKind === 'digest' ? 'DIGEST PRINTED!' : 'PLATE SERVED!';
+  text(ctx, word, 150 + ((Math.round(t * 6) % 2) ? 1 : 0), 131, PAL.emberHot, 8);
 }
 
 export function render(ctx, scene, events) {
@@ -323,6 +381,9 @@ export function render(ctx, scene, events) {
   drawRoom(ctx, st, t);
   for (let i = 0; i < st.pots.length; i++) {
     drawPot(ctx, st.pots[i], potBox(i), t, events);
+  }
+  if (st.flashUntil && Date.now() < st.flashUntil) {
+    drawServeCelebration(ctx, st, t);
   }
   drawHUDStrip(ctx, st);
 }
