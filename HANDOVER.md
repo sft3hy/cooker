@@ -240,6 +240,19 @@ deep-dives and wrong for latency-critical small steps. Register artifacts only f
 19. **`cooker doctor` "bind port free" warns *because the daemon is live*.** Post-M8,
     two warns (port-in-use + loopback-shadowed :8000) is the healthy steady state.
     Zero warns would mean the daemon is *down*.
+20. **opencode permission replies take `decision`, not `response`** — the wrong key
+    is accepted-shaped and rejects everything silently (§21). Likewise form replies
+    take `answer` (singular), and a session's location directory must **exist**
+    before the first prompt or the server answers `LocationNotFoundError` at prompt
+    time, not at create time.
+21. **`GET /message` answers newest-first** (§21). Collecting "the last element"
+    collects the *oldest* utterance — the first live delegation "succeeded" with
+    its own preamble as the brief. Sort by timestamp; never trust list order.
+22. **`tasks` stores `payload_json`, not `payload`**, and `orders`/origin queries
+    must use `json_extract(payload_json, …)` — the column-name guess fails live,
+    not in the fake. The opencode password rides the env ladder
+    (`OPENCODE_PASSWORD` → `opencode.password_file` → `~/homelab/edge/.env`) and
+    **never** enters `config.yaml` or any committed file.
 
 ---
 
@@ -247,7 +260,7 @@ deep-dives and wrong for latency-critical small steps. Register artifacts only f
 
 ```
 .venv/bin/ruff check src tests bench
-.venv/bin/python -m pytest -q                 # 228 today
+.venv/bin/python -m pytest -q                 # 269 today
 .venv/bin/cooker doctor                        # 0 fail / 2 warn (port-in-use + :8000 shadow) = healthy
 .venv/bin/cooker status                        # queue + backoff + gate
 launchctl print gui/$(id -u)/com.homelab.cooker | grep state   # running
@@ -291,8 +304,19 @@ other. `bench11` is read-only; `bench12` asserts its own decision threshold (+75
    run, judged, and the first publish with a score ≥ 3.5 the quality loop actually
    earned. If the kitchen stayed cold on a night nobody used the GPU, the ledger
    judge — not the gate — is the suspect, in that order.
-2. **Make the stub generators real (M9)** — `deep-dive`'s autoresearch delegation and
-   the rest; `brainstorm/generate` proved the drain end-to-end and is the pattern.
+2. **Order something** — the counter is live (§21): the Kitchen tab takes a topic and
+   a kind, or from the shell:
+   `curl -X POST localhost:8256/api/orders -H 'content-type: application/json'
+    -d '{"topic":"why do dotfiles deserve their own manager","kind":"deep-dive"}'`.
+   `deep-dive` delegates to opencode and faces the same judge; `research` is the
+   five-stage way. Pending orders cap at 429 (with the count), pause answers 409.
+   To stop a running delegation: pause (`POST /api/pause`) or `kickstart -k` the
+   daemon — a cancelled delegate interrupts its opencode session before it lets go.
+   The remaining stub generators (`audit` et al) still wait for their edges;
+   `deep-dive` is the pattern they will follow.
 3. Keep the two commandments: interactive always wins, and never report what disk
    cannot confirm. This document has been wrong before and has been rewritten by its
-   own rule — hold everything to that standard.
+   own rule — hold everything to that standard. The live box keeps teaching: the
+   newest-first `GET /message` (§21) broke a passing test suite's collector, so
+   when a number and the device disagree, the device is right and this file is a
+   draft.
