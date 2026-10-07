@@ -530,3 +530,45 @@ to fit. So: shorten the claim gate, size the work to the silence actually observ
 and let the 60-second window keep its original meaning as the gate for *concurrency*
 rather than for *anything at all*. The harm to retreat from is bytes on the wire,
 which is already the trigger, and the retreat is the part worth making faster.
+
+## 17. The wire is never empty: monitors move bytes too (M7 live proofs, 2026-10-07)
+
+Two 300s/240s live claim runs (`cooker serve --live`) claimed nothing, and the
+reason was visible, metronomic, and honest: `ACTIVE_INFER` at **1,719–1,722 B/s
+every 4–5 seconds**, attributed by the wire meter to `OrbStack Helper(18634)`
+plus `opencode(85164)`. Neither run failed because the gate is wrong; both failed
+because the gate was right about bytes it could not classify.
+
+The pulsar, identified by inspection (no change made to the service):
+`edge-dashboard` runs `setInterval(tick, 5000)` and each tick fetches
+`:8000/admin/api/stats?scope=alltime` — an ~8 KB admin response through the
+OrbStack hairpin. Every 5 seconds. Nettop's 3-second windows smear each burst
+forward, so the observable silence between bursts ceilings at ~3–3.5s —
+permanently under `claim_quiet_seconds: 4.0`. On a box running this dashboard,
+**the 4-second window does not exist by construction**, and neither does the
+60-second one.
+
+The deeper correction to §16: bytes are the trigger, but bytes are not inference.
+The dashboard's polling is byte-identical to a small streamed reply at the
+granularity the meter sees (single burst, 2–4 KB/s for one window). Two faces of
+the same lie: "connected and silent" is not generating (§11, keepalive), and
+"moving bytes" is not necessarily generating either (§17, monitor).
+
+What remains true and is now *more* important: `stats.json`'s
+`total_requests` (already read by the detector for mtime) is the honest ledger —
+a monitor poll does not move it, an inference does, whatever the wire says. And
+`/health` is 182 B: asking omlx directly is cheap enough to be polite.
+
+### What this decides
+
+1. The claim gate's 4s stays — it is a measurement of *this box's* quiet and the
+   box was not quiet. Do not lower it to make a demo pass (same rule as the
+   publish threshold).
+2. The fix belongs at the source or in corroboration, in that order:
+   edge-dashboard's admin-stats cadence is Sam's call (one line), and the
+   Cooker-side rule — ACTIVE_INFER requires bytes **plus** corroborated ledger
+   movement or sustained multi-window streaming — depends entirely on one
+   measurement not yet made: does omlx flush `stats.json` at request completion
+   or continuously during generation? If completion-only, ledger corroboration
+   is blind mid-generation and the sustained-stream test must carry the load.
+   Measure before coding.
