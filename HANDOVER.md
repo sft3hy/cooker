@@ -26,6 +26,12 @@ Two constraints outrank every feature:
    does not start, and if it is mid-stage it drops the HTTP connection. Typing,
    browsing, compiling: not the kitchen's business. It is a guest in someone
    else's house — the GPU is the house, not the desk.
+   *Same-day amendment #2 (§21):* Cooker may now **use** OpenCode as a tool —
+   the prohibition was never use, it was wrap. It opens its own sessions through
+   opencode's own HTTP API (§21: `:4096`, documented Basic auth), in
+   directories it owns, answered by policy, interrupted by the ledger like any
+   other burn. It never injects into an existing session and the broker is
+   still dead.
 2. **Verification must be honest.** Never report a PASS, a test count, a file, or a
    commit that was not actually produced. This has gone wrong twice (M5, and once
    mid-M4). `PLAN.md` and `DISCOVERY.md` are the record; if they disagree with disk,
@@ -45,14 +51,15 @@ OFL Press Start 2P, SFX default off). Built into `web/dist/` (gitignored; rebuil
 `cd web && npm ci && npm run build` — node 26 is installed). It is served **right now**
 at `https://cooker.home.arpa` by the launchd-managed LIVE daemon.
 
-**Rooms (tabs, 2026-10-07):** KITCHEN (the stove: canvas, gate badge, drawer, ticker),
-PANTRY (every artifact the kitchen produced — `GET /api/products`, read one with the
-existing `GET /api/artifacts/{ref}`, today's digest via `GET /api/digest`), STATS
-(`GET /api/stats`: per-day tokens/GPU-seconds/serves, per-generator spend, and the
-live GPU picture straight from the gate), GUIDE (plain-language, no-code explanation —
-what the banners mean, the one rule, how the ledger judges). Keys 1–4 switch rooms;
-Esc closes the reader. The tab split was Sam's ask ("declutter, a stats dashboard,
-an outputs tab, kitchen theme"); the renderer in `kitchen.js` was not touched.
+**Rooms (tabs, 2026-10-07):** KITCHEN (the stove: canvas, gate badge, the **order
+counter** — POST `/api/orders {topic, kind: research|deep-dive}` — and the neon
+sign), PANTRY (every artifact — `GET /api/products`, read via
+`GET /api/artifacts/{ref}`, today's digest via `GET /api/digest`; **defaults to the
+served shelf**), STATS (`GET /api/stats`: per-day tokens/GPU-seconds/serves,
+per-generator spend, live GPU picture from the gate), GUIDE (plain-language for
+laymen). Keys 1–4 switch; Esc closes the reader. **Nothing renders raw markdown** —
+`web/src/lib/md.js` escapes-first then themes (it refuses non-http hrefs outright).
+The renderer in `kitchen.js` was not touched by any of this.
 
 **What's left?** M9 (six of eight generators are stubs) and M10 (`IMPLEMENTATION.md`).
 The 4s claim gate is no longer the blocker it was — **as of 11:24:09 today the gate
@@ -76,6 +83,8 @@ scored unattended. Detail and ordering in §5.
 | M6 CLI surface | done | `status add pause resume list show rate digest doctor` |
 | **M7 kitchen UI** | **done** | `d6fe352` + `e3913fc` (font was preloaded but never *declared*; fractional-scale smear). 228 tests, 10 in `tests/test_server.py`; verified through TLS: `/` `/api/state` `/api/events?max_frames=1` fonts all 200 |
 | **UI rooms (§ §20b same day)** | **done** | tabs KITCHEN/PANTRY/STATS/GUIDE + `/api/products` `/api/stats` `/api/digest`; 257 tests (4 new server tests, incl. *published is truth, not cache*). One live trap caught at build time: a component prop named `state` makes Svelte 5 fall out of runes mode silently and the drawer stops being reactive — renamed to `snap`; `svelte/compiler` warnings are now the build gate, and they are zero. |
+
+| **M9 deep-dive = opencode, live (§21)** | **done today** | `opencode.py` drives `:4096` (v2.0.24, Basic auth via env ladder — password never in config.yaml). `/api/orders` counter; delegate→critique→evaluate→publish edges; permissions answered `once` by policy with deny-first list, `always` refused by code; cancel interrupts the session. Live proof: order placed 13:52 → `start: slot0:deep-dive.delegate`. 269 tests, 20 new. |
 | **M8 daemon + registration** | **done today** | launchd `com.homelab.cooker` KeepAlive **running** (`launchctl print` state=running, `serve --live`); Pi-hole A record live; Traefik router+service issued and verified with a homeca cert; `~/HOMELAB-SERVICE-MAP.md` has the routing row, `:8256` port row, Service Entry, dependency edges, Tier-2 listing and dated Changelog line. `doctor` launchd warn → pass |
 | M9 remaining generators | not started | `chains.advance` emits `chain.stub` for `deep-dive project-review homelab-audit brainstorm creation`; the orphan `brainstorm/generate` stage **ran for real at 11:24 and plated** (§20) — the queue drain now works, only the stub generators themselves remain |
 | M10 IMPLEMENTATION.md | not started | definition of done, written at the end |
