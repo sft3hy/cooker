@@ -347,15 +347,24 @@ class OpenCodeError(Exception):
 
 
 def _assistant_text(msgs: list[dict[str, Any]]) -> str:
-    """The last assistant message's text parts, concatenated. Verified live:
-    items are top-level `{type:'assistant', content:[{type:'text'|
-    'reasoning', text}]}` — reasoning is skipped: what the model thought is
-    not what it wrote, and the shelf keeps what it wrote."""
-    out = ""
+    """The NEWEST assistant message's text parts, concatenated — and newest
+    means by timestamp, not by list position, because `GET /message` on
+    2.0.24 returns messages **newest-first** (verified live: the idle
+    sentinel arrived at the head of the list). A collector that takes the
+    last element of the list collects the oldest utterance, which is how
+    the first real delegation "succeeded" with a 250-byte plate of
+    *"I'll research this topic in parallel"* — conversation, not brief.
+    Sorting by time makes the function correct against either order; the
+    fake now matches the device. Reasoning parts stay skipped: what the
+    model thought is not what it wrote."""
+    best, best_ts = "", -1.0
     for m in msgs:
         if m.get("type") != "assistant":
             continue
-        for p in m.get("content") or []:
-            if p.get("type") == "text" and p.get("text"):
-                out = p["text"]
-    return out.strip()
+        t = m.get("time") or {}
+        ts = float(t.get("completed") or t.get("created") or 0)
+        texts = [str(p.get("text")) for p in (m.get("content") or [])
+                 if p.get("type") == "text" and p.get("text")]
+        if texts and ts >= best_ts:
+            best, best_ts = "\n\n".join(texts), ts
+    return best.strip()

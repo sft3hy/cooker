@@ -145,15 +145,29 @@ class FakeOCServer:
                 if p.endswith("/message"):
                     if outer.round < 1 or outer.hang:
                         return self.send({"data": []})
+                    # newest-first, exactly as :4096 answers on 2.0.24 —
+                    # an older-order fake is how the first real brief got
+                    # collected as its own preamble (§21).
                     return self.send({"data": [
-                        {"id": "msg_u", "type": "user", "text": "…"},
+                        {"id": "msg_i", "type": "idle",
+                         "outcome": "succeeded",
+                         "time": {"created": 1791400003000}},
+                        {"id": "msg_b", "type": "assistant", "agent": "build",
+                         "time": {"created": 1791400002000,
+                                  "completed": 1791400002500},
+                         "content": [{"type": "text",
+                                      "text": "# brief\n\nthe real final "
+                                            "content."}],
+                         "tokens": {"input": 100, "output": 7}},
                         {"id": "msg_a", "type": "assistant", "agent": "build",
+                         "time": {"created": 1791400001000,
+                                  "completed": 1791400001500},
                          "content": [{"type": "reasoning", "text": "hmm"},
                                      {"type": "text",
-                                      "text": "# brief\n\nreal content."}],
-                         "tokens": {"input": 100, "output": 7}},
-                        {"id": "msg_i", "type": "idle",
-                         "outcome": "succeeded"},
+                                      "text": "I'll research this in parallel."}],
+                         "tokens": {"input": 0, "output": 0}},
+                        {"id": "msg_u", "type": "user", "text": "…",
+                         "time": {"created": 1791400000000}},
                     ]})
                 if p.endswith("/permission"):
                     rows = [{"id": "per_safe", "sessionID": "ses_fake",
@@ -234,6 +248,8 @@ def test_loop_grants_safe_rejects_dangerous_and_delivers_the_brief(
     assert fake.created[0]["location"]["directory"] == str(wd)
     assert fake.basic_seen and fake.basic_seen.startswith("Basic ")
     assert res.completed and res.text.startswith("# brief")
+    assert "final" in res.text and "parallel" not in res.text, \
+        "the newest assistant turn wins — never the preamble (§21)"
     assert res.input_tokens == 100 and res.output_tokens == 7
     got = dict(fake.replies)
     assert got.get("per_safe") == "once", "safe reads are granted, once"
