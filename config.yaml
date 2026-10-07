@@ -1,0 +1,124 @@
+# Cooker — configuration of record.
+# Every value here is deliberately conservative. Make it fast later, not now.
+
+daemon:
+  bind_host: 127.0.0.1          # tailnet reaches it through Traefik, never bind 0.0.0.0
+  port: 8256                    # registered in ~/HOMELAB-SERVICE-MAP.md
+  data_dir: var               # relative to repo root unless absolute
+  log_level: INFO
+
+# ---------------------------------------------------------------------------
+# Politeness: the whole point. Interactive work on this box must not feel it.
+# ---------------------------------------------------------------------------
+detect:
+  interval_seconds: 1.0
+  # lsof watches the raw socket; this is a SEPARATE concern from how we
+  # connect (inference.base_url). omlx listens on :8000 on every interface.
+  omlx_port: 8000
+  omlx_proc_names: [omlx, omlx-server]
+  # Ordered URLs to try, best first. https/home.arpa beats raw IPs, which
+  # beat loopback (occupied by a stray http.server on this host).
+  base_url_candidates:
+    - https://omlx.home.arpa/v1
+    - http://192.168.1.20:8000/v1
+    - http://127.0.0.1:8000/v1
+  opencode_port: 4096
+  opencode_wal: ~/.local/share/opencode/opencode.db-wal
+  hid_idle_command_timeout_seconds: 2.0
+  lsof_command_timeout_seconds: 2.0
+  # A stage in flight is allowed to finish under ACTIVE_USER (work is not
+  # thrown away), but never longer than this.
+  max_stage_seconds: 180
+  user_idle_seconds: 120        # HID quieter than this => not ACTIVE_USER
+  opencode_wal_seconds: 30      # WAL touched within this => ACTIVE_USER
+  fs_activity_seconds: 60       # a file saved within this => ACTIVE_USER
+  interactive_cooldown_seconds: 60   # quiet period after ACTIVE_INFER ends
+  idle_confirm_seconds: 60      # must stay quiet this long before ramping up
+
+scheduler:
+  max_concurrency: 1            # Sam's throttled rollout: ramp 1 -> n when proven
+  min_concurrency: 0
+  tick_seconds: 1.0
+  # Self-inflicted brake: if our own background p95 TTFT exceeds this, halve.
+  latency_p95_ceiling_s: 4.0
+  backoff_base_seconds: 30
+  backoff_max_seconds: 3600
+  max_attempts: 3
+
+inference:
+  # https://omlx.home.arpa is Traefik -> omlx's Tailscale IP. This is the
+  # stable route: it survives a DHCP change and is immune to whatever happens
+  # to be bound to 127.0.0.1:8000 on this host (there IS one: a stray
+  # http.server in ~/dev/mm-visit-itinerary shadows loopback right now).
+  base_url: https://omlx.home.arpa/v1
+  ca_file: ~/homelab/edge/step/certs/root_ca.crt
+  model: Qwen3.8-Flash-Next-oQ4e-mtp
+  api_key_env: AR_LLM_API_KEY     # read from ~/dev/autoresearch-service/.env
+  api_key_file: ~/dev/autoresearch-service/.env
+  # Derived from the prefill ladder (bench #5). Prefill is atomic and
+  # exclusive on omlx: 1000 tok => 1.8x idle TTFT, 2000 => 3.0x, 8000 => 14x.
+  # Only <=1000-token prefills keep interactive latency under 3x idle.
+  max_prefill_tokens_per_request: 1000
+  max_tokens_floor: 512           # this model streams reasoning first; a small
+                                  # budget buys finish_reason=length and no answer
+  default_temperature: 0.7
+  request_timeout_seconds: 300
+  connect_timeout_seconds: 5
+  # Mechanical stages do not need a chain of thought; make them cheap and fast.
+  thinking_off_stages:
+    - extract
+    - scan
+    - collect
+    - consolidate
+    - publish
+
+search:
+  searxng_url: https://searxng.home.arpa/search
+  ca_file: ~/homelab/edge/step/certs/root_ca.crt
+  timeout_seconds: 20
+  max_results: 8
+  fetch_max_bytes: 262144
+
+delegate:
+  autoresearch_url: https://autoresearch.home.arpa
+  enabled: true
+
+quality:
+  publish_threshold: 3.5
+  dedup_window_days: 14
+  feedback_ema_floor: 2.5
+  feedback_park_after: 5
+
+safety:
+  max_disk_gb: 2.0
+  max_task_runtime_minutes: 20
+  outputs_dir: outputs
+  # git is only ever run through safety.git_readonly(); these are the only
+  # subcommands it will accept. Anything else raises.
+  git_readonly_subcommands:
+    - status
+    - diff
+    - log
+    - show
+    - blame
+    - ls-files
+    - ls-tree
+    - remote
+    - rev-parse
+    - shortlog
+    - tag
+    - describe
+
+ui:
+  sfx_default: off
+  canvas_width: 480
+  canvas_height: 270
+
+generators:
+  research:      { enabled: true,  weight: 3 }
+  deep-dive:     { enabled: true,  weight: 1 }
+  project-review: { enabled: true, weight: 2 }
+  homelab-audit: { enabled: true,  weight: 1 }
+  brainstorm:    { enabled: true,  weight: 2 }
+  creation:      { enabled: true,  weight: 1 }
+  digest:        { enabled: true,  weight: 1 }

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Runtime state — never commit the kitchen's brain
+var/
+*.db
+*.db-wal
+*.db-shm
+outputs/
+logs/
+
+# Frontend
+web/node_modules/
+web/dist/
+web/.svelte-kit/
+
+# Secrets. Always.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
