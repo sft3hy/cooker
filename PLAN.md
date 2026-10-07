@@ -186,13 +186,15 @@ Each milestone is independently useful and shippable. One at a time.
 | M3 cancellable inference, safety gate | **done** | `bench8_cancellation_live.py` — 1,711 B/s busy → inflight 0 → baseline |
 | M4 research DAG | **done** | `bench9_research_chain_live.py` Test 1 PASS, 7/7 stages |
 | M5 gate, dedup, feedback, digest | **done** | `bench10_digest_live.py` Test 3 PASS — 8 stages live, evaluated, digest rendered with the rows' own numbers |
-| M6 CLI surface | partial | `rate digest feedback park unpark` landed with M5; `list show` still M6 |
+| M6 CLI surface | **done** | `status add pause resume list show rate digest doctor` all live against a scratch DB; 19 tests in `tests/test_cli.py`; the ids `list` prints are asserted to resolve in `rate`/`show` |
 | M7 kitchen UI | not started | **no node/npm on this shell's PATH** — install first |
 | M8 launchd + Traefik + register | not started | see §11 ceremony |
 | M9 remaining generators | not started | `chains.advance` emits `chain.stub` for them today; one orphan `brainstorm/generate` stage sits QUEUED as proof |
 | M10 IMPLEMENTATION.md | not started | — |
 
-**Nothing is pushed.** `master` is local.
+**Pushed.** `main` is on GitHub at `df0eac1` plus the M6 work; the branch has
+always been `main`, and an earlier note here calling it `master` was wrong in the
+same breath as claiming nothing was pushed.
 
 Carried forward, unresolved and named so:
 

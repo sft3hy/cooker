@@ -526,3 +526,26 @@ def state(conn: sqlite3.Connection, cfg: Config) -> dict[str, Any]:
                     "SELECT DISTINCT generator FROM artifacts").fetchall()]},
         "threshold": float(cfg.get("quality.publish_threshold", 3.5)),
     }
+
+
+def resolve_task(conn: sqlite3.Connection, ref: str) -> sqlite3.Row | None:
+    """Find a stage by id or by the eight-character tail `cooker list` prints.
+
+    Mirrors `resolve_artifact` deliberately: the same id comes out of `list`,
+    `digest` and `show`, so the same id has to go back into all of them. An
+    ambiguous match is refused, not guessed.
+    """
+    row = conn.execute("SELECT * FROM tasks WHERE id=? LIMIT 1", (ref,)).fetchone()
+    if row:
+        return row
+    if len(ref) < 4:
+        return None
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE id LIKE ?"
+        " OR substr(replace(id, '-', ''), -8) = ?"
+        " ORDER BY created_at DESC", (ref + "%", ref.replace("-", ""))).fetchall()
+    if len(rows) == 1:
+        return rows[0]
+    if len(rows) > 1:
+        raise ValueError(f"{ref!r} matches {len(rows)} stages; give more characters")
+    return None

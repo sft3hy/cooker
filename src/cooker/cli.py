@@ -20,8 +20,9 @@ import sys
 import time
 from datetime import date
 from pathlib import Path
+from typing import Any
 
-from cooker import __version__, daemon, db, detect, digest, net
+from cooker import __version__, chains, daemon, db, detect, digest, net
 from cooker import eval as eval_mod
 from cooker.config import Config, load_config
 
@@ -265,11 +266,51 @@ def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
         rep.ok("database", f"{cfg.db_path} ({'created' if fresh else 'migrated'})")
         counts = db.queue_counts(conn)
         rep.info("tasks", json.dumps(counts) if counts else "empty")
+        # WAL is not a performance detail here: the queue's atomic claim relies on
+        # it, so a database that silently reverted to rollback journal mode means
+        # two workers can take the same stage. Ask, don't assume.
+        mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        (rep.ok if mode == "wal" else rep.fail)(
+            "journal mode", mode + ("" if mode == "wal" else " — claim is not safe"))
+        busy = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        (rep.ok if busy > 0 else rep.warn)("busy_timeout", f"{busy}ms")
+        integrity = str(conn.execute("PRAGMA integrity_check").fetchone()[0])
+        (rep.ok if integrity == "ok" else rep.fail)("integrity check", integrity)
     finally:
         conn.close()
 
+    used = dir_bytes(cfg.outputs_dir)
+    cap_gb = float(cfg.get("safety.max_disk_gb", 2.0))
+    near = used > cap_gb * 1024**3 * 0.8
+    (rep.warn if near else rep.ok)(
+        "outputs disk", f"{used / 1024**2:.1f} MB of {cap_gb:.1f} GB")
+
     if not args.offline:
         asyncio.run(_net_checks(cfg, rep))
+
+    # launchd. The plist does not exist until M8 installs it, so this is a warn
+    # with the reason rather than a fail: the daemon running in a terminal today
+    # and never restarting tomorrow is the difference this check exists to name.
+    label = str(cfg.get("daemon.launchd_label", "com.homelab.cooker"))
+    plist = Path(f"~/Library/LaunchAgents/{label}.plist").expanduser()
+    if not plist.exists():
+        rep.warn("launchd", f"{label} not installed — M8 (cooker will not survive "
+                            "a reboot or a logout)")
+    elif args.offline:
+        rep.info("launchd", f"{plist.name} present; state not checked (--offline)")
+    else:
+        uid = os.getuid()
+        out = subprocess.run(["launchctl", "print", f"gui/{uid}/{label}"],
+                             capture_output=True, text=True, timeout=10)
+        loaded = out.returncode == 0
+        state = "unknown"
+        for line in (out.stdout or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("state =", "path =")):
+                state = stripped.split("=", 1)[1].strip()
+                break
+        (rep.ok if loaded else rep.fail)(
+            "launchd", f"{state}" if loaded else f"{label} not loaded")
 
     print("-" * 46)
     print(f"{rep.failed} fail, {rep.warned} warn")
@@ -464,16 +505,223 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def cmd_add(cfg: Config, args: argparse.Namespace) -> int:
-    """Put one stage in the queue. The generator chains land in M4; until then
-    this is how you give the scheduler something real to point at."""
+    """`cooker add "a topic"` queues a whole research chain.
+
+    The one-stage form (`--kind/--generator/--title`) stays, because poking a
+    specific stage of an existing chain is a different job from asking for new
+    research, and the daemon's own stages are worth being able to add by hand.
+
+    A topic inside the dedup window is queued anyway, with a warning. The 14-day
+    rule exists to stop the *daemon* repeating itself; a human naming the topic a
+    second time is not the daemon repeating itself, and silently dropping the
+    request would be the machine overruling the person who just typed into it.
+    """
     conn = db.connect(cfg.db_path)
     db.migrate(conn)
-    task = db.create_task(conn, chain_id=args.chain or db.new_id(), kind=args.kind,
-                          generator=args.generator, title=args.title,
-                          prompt=args.prompt, priority=args.priority)
-    print(f"{OK} queued {task.generator}.{task.kind}  {task.id}")
-    conn.close()
-    return 0
+    try:
+        if args.topic:
+            topic = " ".join(args.topic).strip()
+            if not topic:
+                print(f"{FAIL} add needs a topic: cooker add \"why prefill blocks\"")
+                return 2
+            if args.kind or args.title:
+                print(f"{WARN} a topic makes the whole chain; --kind/--title ignored")
+            days = float(cfg.get("quality.dedup_window_days", 14))
+            if chains.seen_recently(conn, chains.topic_hash(topic), days=days):
+                print(f"{WARN} \"{topic[:60]}\" was researched in the last {days:.0f}"
+                      " days — queueing it anyway, you asked")
+            chain = chains.seed(cfg, conn, topic, priority=args.priority)
+            stages = conn.execute(
+                "SELECT kind, id FROM tasks WHERE chain_id=? ORDER BY id",
+                (chain,)).fetchall()
+            print(f"{OK} queued a research chain: {chain[:8]}")
+            # The chain is not all queued at once — each stage is created when its
+            # parent succeeds — so listing "plan" alone is the truth, and saying
+            # why stops it reading as a bug in the seeding.
+            print(f"      now: {' → '.join(s['kind'] for s in stages)};"
+                  " the rest appear as each stage finishes")
+            return 0
+        if not args.title:
+            print(f"{FAIL} add needs a topic, or --title with --kind")
+            return 2
+        task = db.create_task(conn, chain_id=args.chain or db.new_id(),
+                              kind=args.kind or "plan", generator=args.generator,
+                              title=args.title, prompt=args.prompt,
+                              priority=args.priority)
+        print(f"{OK} queued {task.generator}.{task.kind}  {task.id}")
+        return 0
+    finally:
+        conn.close()
+
+
+# --- queue inspection (M6) -----------------------------------------------
+
+
+def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
+    """What is in here. Artifacts first, then the live half of the queue.
+
+    ids print in the tail form `cooker rate` accepts, because the alternative is
+    printing a uuid and then making you go and find the eight characters that
+    actually resolve — and `[:8]` of a uuid7 is a timestamp, so the eight you would
+    have copied identify nothing.
+    """
+    conn = db.connect(cfg.db_path)
+    db.migrate(conn)
+    try:
+        limit = int(args.limit)
+        what = args.what
+        if what in ("artifacts", "all"):
+            rows = conn.execute(
+                "SELECT a.id, a.generator, a.title, a.status, a.path, a.created_at,"
+                " t.chain_id FROM artifacts a LEFT JOIN tasks t ON t.id = a.task_id"
+                " ORDER BY a.created_at DESC LIMIT ?", (limit,)).fetchall()
+            print(f"artifacts ({len(rows)} shown)")
+            if not rows:
+                print("  none yet")
+            for r in rows:
+                ev = digest.score_for_chain(conn, str(r["chain_id"] or ""))
+                score = (f"{ev['overall']:>4.2f}" if ev["verdict"] != "UNEVALUATED"
+                         else "  —  ")
+                age = _age(time.time() - float(r["created_at"]))
+                print(f"  {eval_mod.short_id(str(r['id']))}  {score}  {r['status']:<10}"
+                      f"  {age:>7}  {digest.strip_stage_prefix(str(r['title']))[:52]}")
+        if what in ("queue", "all"):
+            live = (db.QUEUED, db.RUNNING, db.PAUSED, db.PARKED)
+            rows = conn.execute(
+                "SELECT id, kind, generator, title, status, not_before, attempts"
+                " FROM tasks WHERE status IN ({}) ORDER BY priority ASC, created_at"
+                " DESC LIMIT ?".format(",".join("?" * len(live))),
+                (*live, limit)).fetchall()
+            print(f"\nlive queue ({len(rows)} shown)")
+            if not rows:
+                print("  nothing queued — the queue refills itself from topics.md")
+            for r in rows:
+                wait = float(r["not_before"] or 0) - time.time()
+                held = f" backoff {wait:.0f}s" if wait > 0 else ""
+                print(f"  {eval_mod.short_id(str(r['id']))}  {r['status']:<8}"
+                      f" {r['generator']}.{r['kind']:<12}{held}"
+                      f"  {r['title'][:40]}")
+        if what in ("rejected", "failed"):
+            rows = conn.execute(
+                "SELECT id, kind, generator, title, status, error, finished_at"
+                " FROM tasks WHERE status IN (?,?) ORDER BY finished_at DESC"
+                " LIMIT ?", (db.REJECTED, db.FAILED, limit)).fetchall()
+            print(f"\nnot published ({len(rows)} shown)")
+            for r in rows:
+                print(f"  {eval_mod.short_id(str(r['id']))}  {r['status']:<9}"
+                      f" {r['generator']}.{r['kind']:<12}"
+                      f" {str(r['error'] or '')[:56]}")
+        return 0
+    finally:
+        conn.close()
+
+
+def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
+    """One thing, everything the database knows about it.
+
+    The point of `show` is that you get the score, the evaluator's sentence, the
+    path and the rate command without opening three tools, so all four are here and
+    none of them is re-derived from the model.
+    """
+    conn = db.connect(cfg.db_path)
+    db.migrate(conn)
+    try:
+        row = eval_mod.resolve_artifact(conn, args.id)
+        t_row = None
+        if row is not None:
+            t_row = conn.execute("SELECT * FROM tasks WHERE id=?",
+                                 (row["task_id"],)).fetchone() if row["task_id"] else None
+        else:
+            # A stage rather than an artifact: resolved the same way, because the
+            # id came from the same list.
+            t_row = eval_mod.resolve_task(conn, args.id)
+            if t_row is None:
+                print(f"{FAIL} nothing matches {args.id!r};"
+                      " 'cooker list' shows what's here")
+                return 1
+
+        if row is not None:
+            print(f"artifact {row['id']}")
+            print(f"  {row['status']}  {row['generator']}  {row['title']}")
+            print(f"  path   {row['path']}")
+            p = Path(str(row["path"]))
+            size = p.stat().st_size if p.exists() else None
+            print(f"  file   {'exists' if size is not None else 'MISSING'}"
+                  + (f"  ({size:,} bytes)" if size is not None else ""))
+            print(f"  hash   {str(row['hash'])[:16]}…")
+            chain_id = str(t_row["chain_id"]) if t_row else ""
+            ev = digest.score_for_chain(conn, chain_id)
+            if ev["verdict"] == "UNEVALUATED":
+                print("  score  never evaluated — the gate did not run on this one")
+            else:
+                print(f"  score  {ev['overall']:.2f}  {ev['verdict']}"
+                      + (f"  ({ev['axes']})" if ev["axes"] else ""))
+                if ev["partial"]:
+                    print(f"         *{ev['partial']}*")
+                reason = digest.rationale_for_chain(conn, chain_id)
+                if reason:
+                    print(f"  judge  {reason}")
+            print(f"  rate   cooker rate {eval_mod.short_id(str(row['id']))}"
+                  " good|meh|bad")
+            if chain_id:
+                _print_chain(conn, chain_id)
+            return 0
+
+        assert t_row is not None
+        print(f"stage {t_row['id']}")
+        print(f"  {t_row['status']}  {t_row['generator']}.{t_row['kind']}"
+              f"  {t_row['title']}")
+        print(f"  chain  {t_row['chain_id']}")
+        deps = json.loads(str(t_row["dependencies"] or "[]"))
+        if deps:
+            print(f"  deps   {', '.join(str(d)[:8] for d in deps)}")
+        if t_row["error"]:
+            print(f"  error  {t_row['error']}")
+        if t_row["result_path"]:
+            print(f"  file   {t_row['result_path']}")
+        tin, tout = int(t_row["input_tokens"] or 0), int(t_row["output_tokens"] or 0)
+        if tin or tout:
+            print(f"  tokens {tin:,} in / {tout:,} out"
+                  f"  ttft {float(t_row['ttft_ms'] or 0):.0f}ms"
+                  f"  {float(t_row['duration_ms'] or 0):.0f}ms"
+                  f"  preemptions {int(t_row['preemptions'] or 0)}")
+        if float(t_row["not_before"] or 0) > time.time():
+            print(f"  held   backoff until "
+                  f"{_hhmmss(float(t_row['not_before']))}"
+                  f" ({float(t_row['not_before']) - time.time():.0f}s)")
+        _print_chain(conn, str(t_row["chain_id"]))
+        evs = [e for e in db.tail_events(conn, limit=400)
+               if e.get("task_id") == t_row["id"]][-8:]
+        if evs:
+            print("  events")
+            for e in evs:
+                print(f"    {_hhmmss(float(e['ts']))} {e['type']:<20}"
+                      f" {str(e['message'] or '')[:60]}")
+        return 0
+    except ValueError as exc:
+        print(f"{FAIL} {exc}")
+        return 1
+    finally:
+        conn.close()
+
+
+def _print_chain(conn: sqlite3.Connection, chain_id: str) -> None:
+    st = chains.chain_state(conn, chain_id)
+    if not st or not st.get("stages"):
+        return
+    print(f"  state  {st['state']}  ({st['done']}/{st['total']} stages)")
+    for s in st["stages"]:
+        print(f"           {s['kind']:<12} {s['status']}")
+
+
+def _age(seconds: float) -> str:
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    if seconds < 172800:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
 
 
 def cmd_pause(cfg: Config, args: argparse.Namespace) -> int:
@@ -596,6 +844,217 @@ def cmd_feedback(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+# --- status (M6) ------------------------------------------------------
+
+
+def dir_bytes(path: Path) -> int:
+    """Total size of a directory tree, 0 if it is not there.
+
+    Not `du`: shelling out to measure our own output directory means the answer
+    depends on a binary we have to find first, and `du`'s block rounding reports
+    4 KB for a 200-byte file, which matters when the warning threshold is a
+    fraction of the cap.
+    """
+    if not path.exists():
+        return 0
+    total = 0
+    for child in path.rglob("*"):
+        try:
+            if child.is_file():
+                total += child.stat().st_size
+        except OSError:
+            continue  # a file that vanished mid-walk is not an error worth raising
+    return total
+
+
+def collect_status(cfg: Config, conn: sqlite3.Connection) -> dict[str, Any]:
+    """Everything `cooker status` says, as data, so the test can read the same
+    structure the terminal reads rather than scraping stdout.
+
+    Backoff is the part the spec asks for and the easy version omits: a queue
+    count of 3 says nothing about whether those 3 are waiting for the GPU to free
+    up or waiting on a parent stage that already failed. Those are different
+    situations with different fixes, and only the first one resolves itself.
+    """
+    now = time.time()
+    counts = db.queue_counts(conn)
+    waiting = conn.execute(
+        "SELECT id, kind, generator, not_before, preemptions FROM tasks"
+        f" WHERE status = '{db.QUEUED}' AND not_before > ? ORDER BY not_before"
+        " LIMIT 10", (now,)).fetchall()
+    blocked = conn.execute(
+        "SELECT id, kind, generator, error FROM tasks WHERE status = ?"
+        " ORDER BY finished_at DESC LIMIT 10", (db.PARKED,)).fetchall()
+    running = conn.execute(
+        "SELECT id, kind, generator, started_at FROM tasks WHERE status = ?",
+        (db.RUNNING,)).fetchall()
+
+    def last(types: tuple[str, ...]) -> dict[str, Any] | None:
+        ph = ",".join("?" * len(types))
+        row = conn.execute(
+            f"SELECT ts, type, message FROM events WHERE type IN ({ph})"
+            " ORDER BY id DESC LIMIT 1", types).fetchone()
+        return dict(row) if row else None
+
+    state = last(("bus.state",))
+    today_cost = digest.day_cost(conn, date.today())
+    published = int(conn.execute(
+        "SELECT COUNT(*) n FROM artifacts WHERE status = ?",
+        (db.PUBLISHED,)).fetchone()["n"])
+    # the same directory the writer writes into, not a second definition of it
+    used = dir_bytes(cfg.outputs_dir)
+    cap_gb = float(cfg.get("safety.max_disk_gb", 2.0))
+    topics = chains.read_topics(cfg)
+    st = eval_mod.state(conn, cfg)
+    return {
+        "paused": db.get_meta(conn, "paused") or "",
+        "running": [dict(r) for r in running],
+        "counts": counts,
+        "backoff": [{
+            "id": str(r["id"]), "kind": str(r["kind"]),
+            "generator": str(r["generator"]),
+            "remaining_s": round(float(r["not_before"]) - now, 1),
+            "preemptions": int(r["preemptions"] or 0),
+        } for r in waiting],
+        "parked_stages": [{"id": str(r["id"]), "kind": str(r["kind"]),
+                           "error": str(r["error"] or "")[:80]} for r in blocked],
+        "state": state,
+        # None means "nothing is waiting on a clock": an empty queue, or work that
+        # is runnable right now. It is not zero, and printing zero here would be
+        # inventing an ETA for dependency-blocked chains — the mistake a previous
+        # commit had to go back and undo.
+        "next_runnable_s": (round(eta - time.time(), 1)
+                            if (eta := db.next_runnable_eta(conn)) else None),
+        "generators": {"allowed": st["allowed"], "parked": st["parked"],
+                       "ema": st["ema"]},
+        "today": {**today_cost, "published": published},
+        "digest": str(digest.digest_path(cfg, date.today())),
+        "disk": {"bytes": used, "cap_bytes": int(cap_gb * 1024**3),
+                 "near": used > cap_gb * 1024**3 * 0.8},
+        "topics": {"count": len(topics), "next": topics[0] if topics else None},
+    }
+
+
+def _clip(text: str, width: int) -> str:
+    """Cut to width at the last whole word.
+
+    Mid-word truncation is how the panel came to read `keepalive: OrbStack He`,
+    which looks like a bug in the detector rather than a bug in the formatter — and
+    a reader who cannot tell which of the two it is stops trusting the panel.
+    """
+    t = str(text or "")
+    if len(t) <= width:
+        return t
+    cut = t[:width]
+    space = cut.rfind(" ")
+    return (cut[:space] if space > width // 2 else cut).rstrip() + "…"
+
+
+def _row(marker: str, label: str, value: str) -> str:
+    """One aligned line. Padded here rather than in each caller because the
+    markers carry ANSI escapes, so counting spaces in the source does not tell you
+    where the column lands on screen — which is exactly how `disk` came out one
+    character wide last time this was written by hand."""
+    return f"{marker} {label:<9} {value}"
+
+
+def render_status(cfg: Config, d: dict[str, Any]) -> str:
+    threshold = float(cfg.get("quality.publish_threshold", 3.5))
+    lines = [f"cooker {__version__}  queue", "-" * 58]
+    if d["paused"]:
+        lines.append(f"{WARN} PAUSED: {d['paused']}   ('cooker resume' to cook)")
+    state = d["state"]
+    if state:
+        lines.append(f"{INFO} detector {_hhmmss(float(state['ts']))}"
+                     f" {_clip(state['message'], 46)}")
+    else:
+        lines.append(f"{INFO} detector  no reading yet — run 'cooker watch'")
+
+    live = {k: v for k, v in d["counts"].items()
+            if k in (db.QUEUED, db.RUNNING, db.PAUSED, db.PARKED) and v}
+    lines.append(f"{INFO} queue     " + (", ".join(f"{v} {k.lower()}"
+                                                    for k, v in live.items())
+                                           or "empty"))
+    if d["running"]:
+        for r in d["running"]:
+            age = time.time() - float(r["started_at"] or time.time())
+            lines.append(f"            running {r['generator']}.{r['kind']}"
+                         f"  {age:.0f}s")
+
+    # backoff, named. "3 queued" and "3 waiting on a dead parent" look identical
+    # in a count and mean completely different things — only the first one resolves
+    # itself while you are not looking at it.
+    if d["backoff"]:
+        lines.append(_row(INFO, "backoff", f"{len(d['backoff'])} stage(s) waiting:"))
+        for b in d["backoff"]:
+            why = (f"{b['preemptions']} preemption(s)" if b["preemptions"]
+                   else "waiting")
+            lines.append(f"            {eval_mod.short_id(b['id'])}"
+                         f" {b['generator']}.{b['kind']:<12} {why}:"
+                         f" {b['remaining_s']:.0f}s")
+    if d["next_runnable_s"] is not None:
+        lines.append(f"            next runnable in {d['next_runnable_s']:.0f}s")
+    elif not live:
+        lines.append("            nothing to run until a topic arrives or a parent"
+                     " stage finishes")
+    if d["parked_stages"]:
+        lines.append(_row(WARN, "parked",
+                          f"{len(d['parked_stages'])} stage(s) will not run as"
+                          " things stand:"))
+        for b in d["parked_stages"]:
+            lines.append(f"            {eval_mod.short_id(b['id'])} {b['kind']:<12}"
+                         f" {b['error'][:52]}")
+
+    g = d["generators"]
+    allowed = g["allowed"]
+    # `None` and `[]` are different answers — unfiltered versus everything switched
+    # off — and collapsing them is how a config edit that disabled every generator
+    # reads as a healthy queue.
+    allowed_text = (", ".join(allowed) if allowed
+                    else "none" if isinstance(allowed, list) else str(allowed))
+    lines.append(_row(INFO, "loop",
+                      f"threshold {threshold}; allowed {allowed_text}"))
+    for gen, ema in sorted((g["ema"] or {}).items()):
+        if gen in (g["parked"] or {}):
+            ema_text = "—" if ema is None else f"{ema:.2f}"
+            lines.append(f"            {gen:<16} PARKED (ema {ema_text}):"
+                         f" {str(g['parked'][gen])[:40]}")
+
+    t = d["today"]
+    lines.append(_row(INFO, "today",
+                      f"{t['stages']} stages, {t['gpu_seconds']}s GPU,"
+                      f" {t['input_tokens']:,} in / {t['output_tokens']:,} out,"
+                      f" {t['published']} published"))
+    lines.append(_row(INFO, "digest", str(d["digest"])))
+    disk = d["disk"]
+    lines.append(_row(WARN if disk["near"] else INFO, "disk",
+                      f"{disk['bytes'] / 1024**2:.1f} MB of"
+                      f" {disk['cap_bytes'] / 1024**3:.1f} GB"
+                      + ("  (near the cap)" if disk["near"] else "")))
+    if d["topics"]["next"]:
+        lines.append(_row(INFO, "topics",
+                          f"{d['topics']['count']} in the backlog;"
+                          f" next: {str(d['topics']['next'])[:44]}"))
+    else:
+        lines.append(_row(WARN, "topics",
+                          "topics.md is empty — the queue will not refill itself"))
+    return "\n".join(lines)
+
+
+def cmd_status(cfg: Config, args: argparse.Namespace) -> int:
+    conn = db.connect(cfg.db_path)
+    db.migrate(conn)
+    try:
+        d = collect_status(cfg, conn)
+        if getattr(args, "json", False):
+            print(json.dumps(d, indent=2, default=str))
+        else:
+            print(render_status(cfg, d))
+        return 0
+    finally:
+        conn.close()
+
+
 # --- entrypoint -----------------------------------------------------------
 
 
@@ -688,8 +1147,10 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("db_cmd", choices=["init", "selftest", "status"])
     b.set_defaults(func=cmd_db)
 
-    s = sub.add_parser("status", help="one-line queue + state summary")
-    s.set_defaults(func=lambda cfg, a: cmd_db(cfg, argparse.Namespace(db_cmd="status")))
+    s = sub.add_parser("status", help="queue, backoff, loop and cost in one panel")
+    s.add_argument("--json", action="store_true",
+                   help="machine-shaped output (this is also the SSE payload shape)")
+    s.set_defaults(func=cmd_status)
 
     pr = sub.add_parser("probe", help="one real-size inference call, with accounting")
     pr.add_argument("-p", "--prompt", default="Give 3 concise ideas for a pixel-art kitchen UI.")
@@ -714,14 +1175,25 @@ def build_parser() -> argparse.ArgumentParser:
                    help="stop after N seconds (default: run until interrupted)")
     r.set_defaults(func=lambda cfg, a: cmd_run(cfg, a))
 
-    a = sub.add_parser("add", help="queue one stage (full chains land in M4)")
+    a = sub.add_parser("add", help="queue a topic (a whole chain) or one stage")
+    a.add_argument("topic", nargs="*", help="the subject; queues a research chain")
     a.add_argument("-g", "--generator", default="research")
-    a.add_argument("-k", "--kind", default="plan")
-    a.add_argument("-t", "--title", required=True)
+    a.add_argument("-k", "--kind", default=None)
+    a.add_argument("-t", "--title", default=None)
     a.add_argument("-p", "--prompt", default=None)
     a.add_argument("--priority", type=int, default=500)
     a.add_argument("--chain", default=None)
     a.set_defaults(func=cmd_add)
+
+    ls = sub.add_parser("list", help="what is queued and what has been cooked")
+    ls.add_argument("what", nargs="?", default="all",
+                    choices=["all", "artifacts", "queue", "rejected"])
+    ls.add_argument("-n", "--limit", type=int, default=20)
+    ls.set_defaults(func=cmd_list)
+
+    sh = sub.add_parser("show", help="one artifact or stage, with its judgement")
+    sh.add_argument("id", help="id, or the 8-char tail that list and digest print")
+    sh.set_defaults(func=cmd_show)
 
     pa = sub.add_parser("pause", help="stop starting new stages")
     pa.add_argument("note", nargs="*", help="why, shown in the UI")

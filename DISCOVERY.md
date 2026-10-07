@@ -429,3 +429,36 @@ digest offered to "read" a plan. Registration is now `chains.DRAFT_KINDS` — on
 stage per generator, read off PLAN §5 — and publish *promotes* the draft row
 instead of adding a second one. The legacy rows were not deleted; the digest
 filters by the stage that wrote them, so history stays and the index stops lying.
+
+## 15. What the CLI surfaced (M6, 2026-10-07)
+
+Two bugs that only a panel which prints real numbers can expose. Both were live and
+both were invisible from inside the code that caused them.
+
+**The disk quota was watching an empty directory.** `Config.outputs_dir` resolved a
+relative `safety.outputs_dir` against the *config root* (`./outputs`), while
+`chains.day_dir` built `data_dir/outputs` from scratch. The daemon published 212 KB
+into `var/outputs/`; `cooker doctor` reported `0.0 MB of 2.0 GB` about an empty
+`outputs/` beside it. `safety.max_disk_gb` therefore could never fire — the single
+job that number has. `Config.outputs_dir` now resolves relative paths against
+`data_dir`, `chains.day_dir` is built on top of it, and the duplication is gone
+rather than synchronised. `tests/test_cli.py` asserts the writer's directory and the
+quota's directory are the same object's value, and that a phantom `./outputs` is not
+created.
+
+**topics.md's own help text was in the queue.** `read_topics` skipped comments and
+blanks and accepted everything else, so six lines of documentation — starting with
+"One topic per line (`-` bullets and bare lines both work)" — sat *ahead of* the
+real backlog, and `cooker status` cheerfully named it as the next subject for a
+research chain. The first fix (reject bare lines ending in a full stop) failed
+against the live file because the prose is **wrapped**: a paragraph's first line ends
+mid-sentence with no punctuation, so shape-based detection cannot see it. Position
+can: a marked line is always a topic, bare lines count only in a file with no markers
+at all (the promise the plainest possible file needs), and above the first marker a
+bare line is documentation. Six topics, the real six, and the parse test that
+required bare lines to work still passes.
+
+The general shape: **a readable file is a parsed file, and a parsed file will be
+fed to a GPU.** Anything a human can annotate in prose is a queue that can
+misinterpret its own documentation, so the parsed count has to be printed somewhere —
+that is why `status` says `topics 6` rather than nothing.

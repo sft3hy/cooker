@@ -36,7 +36,7 @@ def day_bounds(day: date) -> tuple[float, float]:
     return start, start + 86400.0
 
 
-def _score_for(conn: sqlite3.Connection, chain_id: str) -> dict[str, Any]:
+def score_for_chain(conn: sqlite3.Connection, chain_id: str) -> dict[str, Any]:
     """The chain's judgement, whichever stage's task the evaluation hung on.
 
     The evaluator is its own stage, so its row is keyed to the `evaluate` task
@@ -112,7 +112,7 @@ def day_artifacts(conn: sqlite3.Connection, day: date) -> list[dict[str, Any]]:
         if r["hash"] in seen_hashes:
             continue
         seen_hashes.add(str(r["hash"]))
-        out.append({**dict(r), **_score_for(conn, str(r["chain_id"] or ""))})
+        out.append({**dict(r), **score_for_chain(conn, str(r["chain_id"] or ""))})
     return out
     return out
 
@@ -201,14 +201,14 @@ def render(cfg: Config, conn: sqlite3.Connection, day: date) -> str:
     else:
         lines += ["## Worth reading", ""]
         for i in published:
-            lines.append(f"### {_title(str(i['title']))}")
+            lines.append(f"### {strip_stage_prefix(str(i['title']))}")
             lines.append("")
             lines.append(f"- score **{i['overall']:.2f}** ({i['axes']})")
             if i.get("partial"):
                 lines.append(f"- *{i['partial']}*")
             rel = _relative(cfg, str(i["path"]))
             lines.append(f"- read: `{rel}`")
-            rationale = _rationale(conn, str(i["chain_id"] or ""))
+            rationale = rationale_for_chain(conn, str(i["chain_id"] or ""))
             if rationale:
                 lines.append(f"- evaluator: {rationale}")
             excerpt = _excerpt(str(i["path"]), cfg)
@@ -222,9 +222,9 @@ def render(cfg: Config, conn: sqlite3.Connection, day: date) -> str:
         lines += ["## Cooked, not published", ""]
         for i in rejected:
             note = f" *({i['partial']})*" if i.get("partial") else ""
-            lines.append(f"- **{i['overall']:.2f}** {_title(str(i['title']))[:80]} "
+            lines.append(f"- **{i['overall']:.2f}** {strip_stage_prefix(str(i['title']))[:80]} "
                          f"({i['axes']}){note} — `{_relative(cfg, str(i['path']))}`")
-            reason = _rationale(conn, str(i["chain_id"] or ""))
+            reason = rationale_for_chain(conn, str(i["chain_id"] or ""))
             if reason:
                 lines.append(f"  - evaluator: {reason}")
             # Ratings on rejected work matter most: this is where you can say the
@@ -236,7 +236,7 @@ def render(cfg: Config, conn: sqlite3.Connection, day: date) -> str:
     if unjudged:
         lines += ["## Cooked, never judged", ""]
         for i in unjudged:
-            lines.append(f"- {_title(str(i['title']))[:80]} — the evaluate stage "
+            lines.append(f"- {strip_stage_prefix(str(i['title']))[:80]} — the evaluate stage "
                          f"did not run or did not parse for this one")
         lines.append("")
 
@@ -279,7 +279,7 @@ def _allowed_text(cfg: Config, conn: sqlite3.Connection) -> str:
     return ", ".join(allowed) if allowed else "none — everything is disabled or parked"
 
 
-def _title(raw: str) -> str:
+def strip_stage_prefix(raw: str) -> str:
     """The topic, without the stage prefix the queue puts on every row.
 
     Stripped in one place rather than per-section so a new stage name cannot show
@@ -300,10 +300,10 @@ def _relative(cfg: Config, path: str) -> str:
         return str(path)
 
 
-def _rationale(conn: sqlite3.Connection, chain_id: str) -> str:
+def rationale_for_chain(conn: sqlite3.Connection, chain_id: str) -> str:
     """The evaluator's own sentence, read back from the row it wrote.
 
-    Keyed by chain for the same reason `_score_for` is: the evaluator's row hangs
+    Keyed by chain for the same reason `score_for_chain` is: the evaluator's row hangs
     off the `evaluate` task, not the artifact's. Read rather than re-derived — a
     second inference call to find out why something scored 4.2 is the wrong shape
     of expensive for a file you open every morning.
