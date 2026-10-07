@@ -306,8 +306,7 @@ class StageRunner:
         # first lengthy deep-dive's 1.0. The judge gets a readable topic;
         # the full order lives in the payload, on disk, and at the draft's
         # foot for whoever audits. The scored window is the brief.
-        if len(topic) > 120:
-            topic = topic[:118].rstrip() + "…"
+        topic = short_title(topic, 120)
         if not draft.strip():
             # Nothing to score. An evaluator that invents a draft to score is how
             # a nonexistent artifact gets a 4.8 in the database.
@@ -797,8 +796,13 @@ class StageRunner:
         draft = self._draft_text(task)
         sources = [str(s.get("url")) for s in
                    (task.payload.get("sources") or []) if s.get("url")]
+        # the SAME topic the judge was handed (the request channel trims
+            # lengthy orders) — recomputing with the full order would record
+            # a smaller window than was actually read, which is the books
+            # lying by omission. one crop, one definition, both callers.
         excerpt, _ceiling = self._excerpt_budget(
-            str(task.payload.get("topic") or task.title), sources)
+            short_title(str(task.payload.get("topic") or task.title), 120),
+            sources)
         ev.draft_chars = len(draft)
         ev.evaluated_chars = min(len(draft), excerpt)
         eval_mod.record(self.conn, task.id, ev)

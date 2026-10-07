@@ -938,3 +938,22 @@ prefill allowance (proposed 4,200 tokens ≈ the whole 7 KB brief judged, +1s
 prefill only when busy, gate still drops mid-stage) — stays unraised until
 answered; the bar itself has not moved all day and will not move without
 you.
+
+
+### The first lengthy deep-dive published: 3.8, and a bookkeeping catch
+
+The lengthy backup-strategy order came back **PUBLISHED at 3.8** — the first
+long-form delegated brief to clear the bar, 6,222 bytes served from the
+counter. The judge's rationale was fair and unsentimental: *"highly relevant
+and accurate conceptual framework for diagnosing silent failures… though the
+truncation…"* — it read the front slice and docked it for exactly what it
+was, and 3.8 still cleared 3.5. It earned it.
+
+And the record caught its own lie while I was celebrating: `evaluated_chars`
+was 1,104, recomputed against the FULL 888-char order, while the request had
+built the prompt from the trimmed 120-char topic — so the books understated
+the window the judge actually read by ~770 chars. Same bug as the H1, one
+layer down: a lengthy order leaking into a channel it shouldn't, this time the
+audit channel. One crop (`short_title(topic, 120)`), one definition, both
+callers — request and record can no longer disagree about what was read. The
+first deep-dive published is real; the number beside it is now honest too.
