@@ -1,0 +1,19 @@
+{
+  "name": "cooker-kitchen",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "The pixel kitchen: a 480x270 window into a polite background daemon.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "svelte": "^5.0.0"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "vite": "^6.0.0"
+  }
+}

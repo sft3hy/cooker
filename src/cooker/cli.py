@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import platform
@@ -496,6 +497,71 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
             spent = ", ".join(f"{k} {v:.0f}s"
                               for k, v in summary["seconds_in_state"].items())
             print(f"  time in: {spent}")
+        return 0
+
+    try:
+        return asyncio.run(go())
+    except KeyboardInterrupt:
+        return 130
+
+
+def cmd_serve(cfg: Config, args: argparse.Namespace) -> int:
+    """`cooker serve` — kitchen + API + static UI in one process.
+
+    The web server is a projection of the database, so it could run detached;
+    it runs *mounted* here instead, because the live gate countdowns (quiet
+    seconds, ramp, blockers) exist only inside a running detector, and a kitchen
+    that shows yesterday's bus state with today's confidence is exactly the kind
+    of lie this project has already paid for once. Dry-run by default, like
+    `run`; uvicorn takes no signal handlers so the kitchen's own SIGTERM path —
+    drop connections, sync WAL — stays the single shutdown story.
+    """
+    # Imported inside the function on purpose: server.py imports this module
+    # for `collect_status`, and a top-level import here would be a cycle that
+    # dies at `from cooker.cli import collect_status` before the CLI even
+    # finishes loading.
+    from cooker import server
+
+    async def go() -> int:
+        import uvicorn
+
+        class QuietUvicorn(uvicorn.Server):
+            """uvicorn captures SIGTERM/SIGINT inside `serve()` with its own
+            handlers, which would silently out-rank the kitchen's — and the
+            kitchen's handler IS the shutdown story (drop connections, sync WAL).
+            So uvicorn watches, the kitchen decides."""
+
+            @contextlib.contextmanager
+            def capture_signals(self):
+                yield
+
+        conn = db.connect(cfg.db_path)
+        db.migrate(conn)
+        orphans = db.recover_orphans(conn)
+        kitchen = daemon.Kitchen(cfg, conn, dry_run=not args.live)
+        app = server.create_app(cfg, kitchen=kitchen)
+        mode = "LIVE" if args.live else "dry-run"
+        host, port = cfg.get("daemon.bind_host"), int(cfg.get("daemon.port"))
+        print(f"cooker {__version__} serving {mode} "
+              f"http://{host}:{port}  db={cfg.db_path}")
+        if orphans:
+            print(f"{INFO} recovered {orphans} orphaned stage(s)")
+        uconfig = uvicorn.Config(app, host=host, port=port,
+                                  log_level="warning")
+        asgi = QuietUvicorn(uconfig)
+        serve_task = asyncio.create_task(asgi.serve())
+        cook_task = asyncio.create_task(kitchen.run(seconds=args.seconds))
+        # Whoever ends first ends both: the -s alarm stops the web too, and a
+        # SIGTERM (which the kitchen catches itself) drains uvicorn politely.
+        stop_watch = asyncio.create_task(kitchen.stop.wait())
+        await asyncio.wait([serve_task, stop_watch],
+                          return_when=asyncio.FIRST_COMPLETED)
+        stop_watch.cancel()
+        kitchen.request_stop()
+        asgi.should_exit = True
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await serve_task
+        await cook_task
         return 0
 
     try:
@@ -1174,6 +1240,17 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("-s", "--seconds", type=float, default=None,
                    help="stop after N seconds (default: run until interrupted)")
     r.set_defaults(func=lambda cfg, a: cmd_run(cfg, a))
+
+    sv = sub.add_parser("serve",
+                        help="run kitchen + API + web UI on the configured port")
+    sv_group = sv.add_mutually_exclusive_group()
+    sv_group.add_argument("--live", action="store_true",
+                          help="really cook (the UI works dry-run too)")
+    sv_group.add_argument("--dry-run", action="store_true",
+                         help="the default: narrate, never generate")
+    sv.add_argument("-s", "--seconds", type=float, default=None,
+                    help="stop after N seconds (default: run until interrupted)")
+    sv.set_defaults(func=lambda cfg, a: cmd_serve(cfg, a))
 
     a = sub.add_parser("add", help="queue a topic (a whole chain) or one stage")
     a.add_argument("topic", nargs="*", help="the subject; queues a research chain")
