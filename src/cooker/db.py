@@ -489,7 +489,28 @@ def queue_counts(conn: sqlite3.Connection) -> dict[str, int]:
 
 
 def next_runnable_eta(conn: sqlite3.Connection) -> float | None:
+    """When the next *claimable-if-time-passed* stage stops waiting, or None if
+    nothing is queued at all. Ignores stages blocked on dependencies: waiting on
+    a dependency is not a timer, and reporting a bogus ETA there is how a HUD
+    starts lying."""
     row = conn.execute(
-        f"SELECT MIN(not_before) AS nb FROM tasks WHERE status='{QUEUED}'"
+        f"SELECT MIN(t.not_before) AS nb FROM tasks t WHERE t.status='{QUEUED}'"
+        " AND NOT EXISTS ("
+        "  SELECT 1 FROM json_each(t.dependencies) d"
+        "  LEFT JOIN tasks p ON p.id=d.value"
+        f"  WHERE p.id IS NULL OR p.status NOT IN {_in_sql(DEPS_SATISFIED)})",
     ).fetchone()
-    return row["nb"] if row and row["nb"] else None
+    return float(row["nb"]) if row is not None and row["nb"] is not None else None
+
+
+def runnable_now(conn: sqlite3.Connection) -> int:
+    """Queued stages whose dependencies are met and whose backoff has expired."""
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM tasks t WHERE t.status='{QUEUED}'"
+        f" AND t.not_before <= ? AND NOT EXISTS ("
+        "  SELECT 1 FROM json_each(t.dependencies) d"
+        "  LEFT JOIN tasks p ON p.id=d.value"
+        f"  WHERE p.id IS NULL OR p.status NOT IN {_in_sql(DEPS_SATISFIED)})",
+        (now(),),
+    ).fetchone()
+    return int(row["n"])

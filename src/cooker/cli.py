@@ -280,12 +280,17 @@ def cmd_db(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.db_cmd == "status":
             db.migrate(conn)
+            counts = db.queue_counts(conn)
+            eta = db.next_runnable_eta(conn)
+            running = conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE status=?", (db.RUNNING,)
+            ).fetchone()["n"]
             print(json.dumps({
                 "db": str(cfg.db_path),
-                "queue": db.queue_counts(conn),
-                "next_runnable_in_s": (
-                    round((db.next_runnable_eta(conn) or 0) - time.time(), 1) or None
-                ),
+                "queue": counts,
+                "running": running,
+                "runnable_now": db.runnable_now(conn),
+                "next_runnable_in_s": round(eta - time.time(), 1) if eta else None,
                 "events": conn.execute("SELECT COUNT(*) FROM events").fetchone()[0],
                 "artifacts": conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0],
             }, indent=2))

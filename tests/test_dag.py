@@ -181,9 +181,30 @@ def test_events_are_replayable_by_cursor(conn):
 
 def test_queue_counts_and_eta(conn):
     chain = db.new_id()
+    assert db.next_runnable_eta(conn) is None
+    assert db.runnable_now(conn) == 0
+
     db.create_task(conn, chain_id=chain, kind="x", generator="research", title="a",
                    not_before=time.time() + 3600)
     counts = db.queue_counts(conn)
     assert counts[db.QUEUED] == 1
     eta = db.next_runnable_eta(conn)
     assert eta and eta > time.time() + 3500
+    assert db.runnable_now(conn) == 0, "still in backoff"
+
+
+def test_eta_ignores_dependency_blocked_stages(conn):
+    """A stage waiting on a dependency has no timer. Reporting one is how the
+    HUD starts lying about when work will resume."""
+    chain = db.new_id()
+    db.create_task(conn, chain_id=chain, kind="synthesize", generator="research",
+                   title="blocked forever", dependencies=["missing"])
+    assert db.runnable_now(conn) == 0
+    assert db.next_runnable_eta(conn) is None, "dep-blocked is not a backoff"
+
+
+def test_immediately_runnable_reports_zero_wait(conn):
+    chain = db.new_id()
+    db.create_task(conn, chain_id=chain, kind="x", generator="research", title="now")
+    assert db.runnable_now(conn) == 1
+    assert db.next_runnable_eta(conn) == 0.0
