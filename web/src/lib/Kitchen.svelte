@@ -216,7 +216,7 @@
     <h2>order at the counter</h2>
   </div>
   <div class="ticket">
-    <textarea class="paper" rows="3" maxlength="200" placeholder="what should the kitchen look into? (8-200 chars)"
+    <textarea class="paper" rows="7" placeholder="what should the kitchen look into? write as long as you like — context is welcome (min 8 chars)"
               bind:value={order.topic}></textarea>
     <div class="ticket-foot">
       <div class="kinds">

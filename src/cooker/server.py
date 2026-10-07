@@ -645,9 +645,12 @@ def create_app(cfg: Config, kitchen: Any = None) -> FastAPI:
             return JSONResponse({"ok": False,
                                  "error": "kind must be research or deep-dive"},
                                 status_code=400)
-        if not (8 <= len(topic) <= 200):
+        # the floor stays (a subject needs enough words to mean something);
+        # the ceiling is the owner's knob now — lengthy orders are the point.
+        cap = int(cfg.get("orders.max_topic_chars", 20000))
+        if not (8 <= len(topic) <= cap):
             return JSONResponse({"ok": False,
-                                 "error": "topic must be 8-200 characters"},
+                                 "error": f"topic must be 8-{cap} characters"},
                                 status_code=400)
         conn, own = conn_for()
         try:

@@ -274,6 +274,30 @@ def test_orders_counter_takes_research_and_deep_dives(client):
                                            for h in head]
 
 
+def test_orders_accept_lengthy_subjects_cap_only_at_the_knob(client):
+    """the owner writes lengthy orders (§ orders amendment): 200 was a
+    guess, the ceiling is now a registered knob, and only the knob refuses."""
+    cl, _c, _conn = client
+    segment = ("why do dotfiles deserve their own manager, considering bare "
+               "git repos, stow symlink farms, chezmoi templating, and the "
+               "Nix home-manager declarative approach — with a recommendation "
+               "for a mixed macOS/Linux household and notes on migrating a "
+               "ten-year-old .zshrc without breaking anything; ")
+    long_topic = segment * 12  # ~1900 chars, spaces intact
+    assert len(long_topic) > 800
+    r = cl.post("/api/orders", json={"topic": long_topic,
+                                       "kind": "deep-dive"})
+    assert r.status_code == 200, "lengthy orders are the point"
+    seen = cl.get("/api/orders").json()["orders"]
+    assert any(o["topic"].startswith("why do dotfiles") and
+               len(o["topic"]) > 800 for o in seen), \
+        "the full topic comes back on the ticket, not a truncation"
+    over = "x" * 21000
+    blocked = cl.post("/api/orders", json={"topic": over,
+                                            "kind": "research"})
+    assert blocked.status_code == 400 and "8-20000" in blocked.json()["error"]
+
+
 def test_orders_are_validated_rate_limited_and_pause_respecting(client):
     cl, _c, conn = client
     assert cl.post("/api/orders", json={"topic": "short"}).status_code == 400

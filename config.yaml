@@ -297,3 +297,6 @@ opencode:
 # not.
 orders:
   max_pending: 3
+  # the owner writes lengthy orders; the ceiling is courtesy, not doubt.
+  # the floor stays at 8 — a subject needs enough words to mean something.
+  max_topic_chars: 20000
