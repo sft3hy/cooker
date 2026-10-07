@@ -56,6 +56,18 @@ FREE_KINDS = frozenset({"search", "fetch", "publish", "collect", "scan",
                         "consolidate"})
 
 
+def short_title(topic: str, limit: int = 90) -> str:
+    """A readable heading for a document whose subject may be an essay.
+
+    The heading is display, not record: the full text lives in the payload,
+    on disk, and at the document's foot. A verbatim lengthy title is how a
+    document starts as a mirror of its own prompt — which the judge, reading
+    a budget-bound front slice, then fairly scores as "truncated fragment
+    of the prompt" (1.0, measured, 2026-10-07)."""
+    topic = topic.strip()
+    return topic if len(topic) <= limit else topic[:limit - 1].rstrip() + "…"
+
+
 # The brief a deep-dive hands opencode. It is written for an assistant
 # with no human on the glass: every question it might ask is pre-answered
 # here, because "answer its prompts when it asks questions" is the owner's
@@ -288,6 +300,14 @@ class StageRunner:
                   (task.payload.get("sources") or []) if s.get("url")]
         budgets = self.cfg.get("inference.stage_max_tokens", {}) or {}
         topic = str(task.payload.get("topic") or task.title)
+        # the judge reads a budget-bound FRONT slice; a lengthy order quoted
+        # twice (instruction header AND draft footer) spends the window on
+        # the prompt and starves the brief -- the exact arithmetic of the
+        # first lengthy deep-dive's 1.0. The judge gets a readable topic;
+        # the full order lives in the payload, on disk, and at the draft's
+        # foot for whoever audits. The scored window is the brief.
+        if len(topic) > 120:
+            topic = topic[:118].rstrip() + "…"
         if not draft.strip():
             # Nothing to score. An evaluator that invents a draft to score is how
             # a nonexistent artifact gets a 4.8 in the database.
@@ -378,11 +398,22 @@ class StageRunner:
             self.emit("safety.injection_flags",
                       f"delegated brief carries instruction-shaped text: "
                       f"{', '.join(flags)}", {"task_id": task.id})
-        doc = (f"# {topic}\n\n{res.text}\n\n---\n\n"
+        # The heading is a readable title, NOT the order verbatim. A lengthy
+        # order under `# {topic}` puts the whole prompt at the very top of
+        # the document, and the evaluator reads a *front* slice (its excerpt
+        # is budget-bound against the prefill ceiling) — so the judge scores
+        # its own restated prompt and calls the brief truncated. It saw
+        # exactly that on the first lengthy order and fairly scored 1.0:
+        # 888 of its ~1,104-char window was the H1. Short heading up top,
+        # the full order preserved intact in the footer for audit — the
+        # words the GPU reads are the brief, and nothing is lost, it is
+        # just not the first thing a reader (or judge) meets.
+        doc = (f"# {short_title(topic)}\n\n{res.text}\n\n---\n\n"
                f"*delegated to opencode session {res.session_id}; "
                f"{res.permissions_granted}/{res.permissions_seen} permissions "
                f"granted (policy), {res.forms_answered} form(s) answered; "
-               f"{'completed' if res.completed else 'stopped early'}*\n")
+               f"{'completed' if res.completed else 'stopped early'}*\n\n"
+               f"*order as written:* {topic}\n")
         try:
             path, digest = await asyncio.to_thread(
                 safety.write_workspace_file, self.cfg, task.id,

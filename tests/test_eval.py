@@ -399,3 +399,42 @@ def test_the_evaluation_budget_is_computed_and_fits(tmp_path: Path) -> None:
     assert "excerpt ends" not in ev.eval_prompt("short subject", "brief note",
                                                   sources, max_chars=budget)
     conn.close()
+
+
+def test_judge_window_survives_a_lengthy_order(tmp_path: Path) -> None:
+    """§ orders + §21's 1.0 lesson: the full order must not eat the judge's
+    excerpt window. Header trimmed to a readable topic, the budget spent on
+    the brief, the full order still on disk and in the payload. The first
+    lengthy deep-dive scored 1.0 because the 888-char order rode the judge's
+    header AND its H1 — 86% of the read window was the prompt itself."""
+    from cooker import chains
+    from cooker import runner as runner_mod
+    c = cfg(tmp_path)
+    conn = conn_fresh()
+    topic = ("review this homelab's backup and snapshot strategy end to "
+             "end: " + "ZFS snapshots, restic copies, launchd drift, " * 40)
+    assert len(topic) > 400
+    chain = chains.seed_deepdive(c, conn, topic)
+    ev_task = db.create_task(conn, chain_id=chain, kind="evaluate",
+                              generator="deep-dive", title="evaluate: backups",
+                              payload={"topic": topic})
+    draft = tmp_path / "deep-dive-delegate.md"
+    draft.write_text("# short readable title\n\n"
+                     "real brief content, paragraph after paragraph. " * 80,
+                     encoding="utf-8")
+    db.merge_payload(conn, str(ev_task.id), {"draft_path": str(draft)})
+    row = conn.execute("SELECT * FROM tasks WHERE id=?",
+                       (ev_task.id,)).fetchone()
+    dt = runner_mod.StageRunner(c, conn, llm=None)  # type: ignore[arg-type]
+    req = dt._eval_request(db.Task.from_row(row))
+    assert "…" in req.user, "a trimmed topic rides the header, not the essay"
+    assert topic not in req.user, ("the lengthy order must not reach the "
+                                    "judge verbatim in BOTH channels")
+    assert "real brief content" in req.user, ("the window belongs to the "
+                                               "brief")
+    assert len(runner_mod.short_title(topic)) == 90
+    assert runner_mod.short_title("short one") == "short one"
+    # and the record: what the judge saw stays auditable next to the score
+    draft_text = draft.read_text(encoding="utf-8")
+    excerpt, _ceil = dt._excerpt_budget(topic[:118] + "…", [])
+    assert 0 < excerpt <= len(draft_text) + 100
