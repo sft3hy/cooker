@@ -902,3 +902,18 @@ cancelled before it ever reached the judge. The story was lovely and the
 ledger could not confirm it, so the ledger wins, here in ink. (See §0:
 never report what the disk cannot confirm — the rule applies to its own
 author last of all.)
+
+
+### The proof, complete (14:18)
+
+The re-ordered deep-dive plated for real: **4,692 bytes** of markdown with
+sections, a tool ladder rendered as a table, and cited sources — produced by
+opencode session `ses_ee7c75fe5ffeTqE2P9xVrxtKVA` over 149.6 wall-seconds
+(4 attempts, one graceful yield to the ledger), burning 45,788 tokens in /
+13,003 out through the same omlx the gate protects. The critique stage
+chewed it (1,643 tok); the judge scored it **3.4 REJECT — "truncated
+excerpts, limiting actionable detail"**, 0.1 under the bar, and the chain
+closed honest: CANDIDATE kept on the shelf, never served. **The first
+deep-dive through opencode's hands bought attention at the judge, not a
+pass — exactly what the amendment promised, now measured rather than
+asserted. The bar stays at 3.5.**
