@@ -514,12 +514,48 @@ def get_meta(conn: sqlite3.Connection, key: str, default: str | None = None) -> 
     return row["value"] if row else default
 
 
+def merge_payload(conn: sqlite3.Connection, task_id: str,
+                  patch: dict[str, Any]) -> dict[str, Any]:
+    """Merge a patch into a stage's payload and return the result.
+
+    Merge, not replace. A stage's payload is written by whoever queued it (the
+    topic, the candidates) and by whatever the stage discovered (the sources it
+    kept); a blind overwrite loses the topic and the chain forgets what it was
+    researching, which is the sort of bug that shows up three stages late as a
+    nonsense artifact rather than here as an error.
+    """
+    row = conn.execute("SELECT payload_json FROM tasks WHERE id=?",
+                       (task_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"no such task: {task_id}")
+    try:
+        payload = json.loads(row["payload_json"] or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.update(patch)
+    conn.execute("UPDATE tasks SET payload_json=? WHERE id=?",
+                 (json.dumps(payload, separators=(",", ":")), task_id))
+    return payload
+
+
 # --- reporting ----------------------------------------------------------
 
 
 def queue_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
-    return {r["status"]: r["n"] for r in rows}
+    """Counts by status, always the full shape.
+
+    `GROUP BY` returns no rows for an empty queue, so a caller who writes
+    `counts[QUEUED]` to ask "is there work?" gets a KeyError at exactly the
+    moment there is no work — which is the state a self-refilling queue spends
+    most of its life in. Every status is present, zeroed.
+    """
+    counts = dict.fromkeys(TASK_STATUSES, 0)
+    for r in conn.execute(
+            "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall():
+        counts[r["status"]] = r["n"]
+    return counts
 
 
 def next_runnable_eta(conn: sqlite3.Connection) -> float | None:

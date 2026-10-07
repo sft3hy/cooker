@@ -22,7 +22,7 @@ import sqlite3
 import time
 from typing import Any
 
-from cooker import db
+from cooker import chains, db
 from cooker import llm as llm_mod
 from cooker import runner as runner_mod
 from cooker.config import Config
@@ -59,6 +59,9 @@ class Kitchen:
         self._prev_ts: float | None = None
         self._prev_key: tuple[str, bool] | None = None
         self.timers: list[asyncio.Task] = []
+        # Only to keep the dry-run's "I would have cooked this" log to once
+        # per empty-queue spell instead of once per second.
+        self._seed_noted = False
 
     def _emit(self, type_: str, message: str,
               data: dict[str, Any] | None = None) -> None:
@@ -95,6 +98,7 @@ class Kitchen:
                   "will not, so the detector will decline to start work")
         try:
             while not self.stop.is_set():
+                self._maybe_seed()
                 decision = await self.scheduler.tick()
                 self._account(decision)
                 for line in self._render(decision):
@@ -105,6 +109,47 @@ class Kitchen:
         finally:
             await self.shutdown()
         return self.summary()
+
+    def _maybe_seed(self) -> None:
+        """Refill the queue when it is empty — the reason an empty queue is a
+        request for work rather than a sign of a dead daemon.
+
+        Dry-run does not seed. It reports the topic it would have chosen and
+        creates nothing, because "dry run" means the database is untouched, and a
+        dry run that writes rows has quietly become a real run with a misleading
+        name. The topic is still resolved and logged, so the pipeline's intent is
+        visible and reviewable before the first live night.
+
+        The live check runs every tick rather than once at startup: the queue
+        empties during a run, not only at the beginning of one. `max_live_research`
+        is what stops that from becoming a flood, so the cap is the throttle and
+        the tick rate is not.
+        """
+        counts = db.queue_counts(self.conn)
+        live = counts.get("QUEUED", 0) + counts.get("RUNNING", 0)
+        if live:
+            self._seed_noted = False
+            return
+        if self.scheduler.dry_run:
+            if self._seed_noted:
+                return
+            self._seed_noted = True
+            picked = chains.next_topic(self.cfg, self.conn)
+            if picked is None:
+                db.emit(self.conn, "dry.topics_exhausted",
+                        message="dry-run: no topic outside the dedup window",
+                        data={})
+                return
+            topic, _ = picked
+            db.emit(self.conn, "dry.would_seed",
+                    message=f"dry-run: would start research on {topic[:70]}",
+                    data={"dry_run": True})
+            return
+        made = chains.seed_research_if_thirsty(self.cfg, self.conn)
+        if made:
+            db.emit(self.conn, "daemon.seeded",
+                    message=f"queue was empty; started {len(made)} research chain(s)",
+                    data={"chains": made, "counts": counts})
 
     async def _alarm(self, seconds: float) -> None:
         await asyncio.sleep(seconds)

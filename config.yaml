@@ -106,7 +106,20 @@ inference:
   request_timeout_seconds: 300
   connect_timeout_seconds: 5
   # Mechanical stages do not need a chain of thought; make them cheap and fast.
+  # Decode is preemptible and fair, so a generous output budget costs the box
+  # nothing it cannot interrupt; it is the *prefill* ceiling that protects you.
+  # One flat 512 for every stage meant a `synthesize` stage spent ~500 tokens
+  # thinking and published an answer cut off mid-sentence with finish=length.
+  stage_max_tokens:
+    plan: 400
+    extract: 700
+    synthesize: 1400
+    critique: 900
+    default: 512
   thinking_off_stages:
+    # `plan` picks search queries. That is selection, not reasoning, and a chain
+    # of thought here costs tokens to produce four lines of text.
+    - plan
     - extract
     - scan
     - collect
@@ -119,10 +132,38 @@ search:
   timeout_seconds: 20
   max_results: 8
   fetch_max_bytes: 262144
+  # Cap enforced *while streaming*, not after: resp.read() on a 200 MB page
+  # allocates 200 MB before you get to say no, and an OOM kill runs no finally.
+  cache_ttl_days: 7
+  cache_max_mb: 256
+  # Substring match against the fetched host. Noise we never want as a source.
+  block_hosts:
+    - youtube.com
+    - facebook.com
+    - x.com
 
 delegate:
   autoresearch_url: https://autoresearch.home.arpa
   enabled: true
+
+research:
+  # Queries per subject. Each one is a SearXNG hit and a handful of fetches,
+  # so this multiplies the noise you make on the internet, not just the cost.
+  max_queries: 3
+  # Sources that become extract stages. This is the GPU bill: N sources is N
+  # prefills. 4 x ~800 tokens stays under the per-request ceiling with room.
+  max_sources: 4
+  # How much of one page a single extract may read. Chosen against the 1000
+  # token prefill ceiling, not against readability.
+  source_context_chars: 2400
+
+topics:
+  file: topics.md
+  # A fresh install with no topics.md still has somewhere to get its first
+  # subject from, rather than quietly doing nothing forever and looking healthy.
+  fallback:
+    - local LLM inference scheduling on Apple Silicon
+    - running a home Kubernetes cluster without becoming a second job
 
 quality:
   publish_threshold: 3.5

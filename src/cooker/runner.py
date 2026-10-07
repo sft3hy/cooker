@@ -1,36 +1,50 @@
-"""runner: turns a claimed stage into a prompt, a completion, and an artifact.
+"""runner: turns a claimed stage into work, and work into an artifact.
 
-This is the seam between the scheduler (which decides *when* and *how many*) and
-`llm.py` (which decides *how to ask*). M4 puts the generator chains behind it;
-M3 is deliberately the smallest honest version, because it is the first code in
-the system that spends real GPU time, and every guarantee the plan makes about
-cancellation and safety has to be true before there are chains worth running.
+The seam between the scheduler (which decides *when* and *how many*) and the
+chains (which decide *what comes next*). M3 was the smallest honest version —
+one prompt, one completion, one file. M4 adds the two things a DAG needs and
+nothing else:
 
-What is non-negotiable here, whatever runs through it:
+    - **dispatch by kind**, because `search` and `fetch` cost network and disk
+      and must not spend a token. A chain that asks the model to "do the search"
+      is a chain that pays for an HTTP client with a GPU.
+    - **fan-in by reading what siblings saved**, because the synthesizer must see
+      the extracts that actually happened, not a summary of what we hoped they'd
+      say. It reads their saved files by dependency id.
+
+What is non-negotiable, whatever runs through here:
 
     - content goes through `safety.scan_secrets` on the way *in*. A secret that
-      reaches the model is gone from this machine's point of view; the scan is the
-      last place it can be caught.
+      reaches the model is gone from this machine's point of view.
     - retrieved context is fenced as untrusted data, never spliced as prose.
-    - the artifact is scanned on the way *out* as well, because the model may
-      have reproduced something it should not have, and an artifact written first
+    - the artifact is scanned on the way *out*, because an artifact written first
       and scrubbed later has been on disk with the secret in it.
-    - cancellation propagates. The `except CancelledError` below records and
-      re-raises: a stage that swallows a cancel is a stage still cooking after
-      the kitchen said stop, and the GPU burn would be invisible.
+    - cancellation propagates. The `except CancelledError` records and re-raises:
+      a stage that swallows a cancel is a stage still cooking after the kitchen
+      said stop, and in a `fetch` that means still pulling bytes too.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sqlite3
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
-from cooker import db, safety
+from cooker import chains, db, safety
+from cooker import search as search_mod
 from cooker.config import Config
 from cooker.llm import LLM, Completion, EndpointGone, PrefillOver, Request
+
+# Kinds that must never reach the accelerator. `plan` is not in here: deciding
+# what to search for is exactly the kind of thing the box is for, and it costs a
+# few hundred tokens to save thousands of irrelevant fetches.
+FREE_KINDS = frozenset({"search", "fetch", "publish", "collect", "scan",
+                        "consolidate"})
 
 
 @dataclass
@@ -40,10 +54,11 @@ class Outcome:
     path: str | None = None
     reason: str | None = None
     completion: Completion | None = None
+    children: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {"task_id": self.task_id, "status": self.status, "path": self.path,
-                "reason": self.reason,
+                "reason": self.reason, "children": list(self.children),
                 "completion": self.completion.as_dict() if self.completion else None}
 
 
@@ -54,27 +69,86 @@ class StageRunner:
     and not here: two owners of one deadline is how a stage gets half-cancelled.
     """
 
-    def __init__(self, cfg: Config, conn: sqlite3.Connection, llm: LLM) -> None:
+    def __init__(self, cfg: Config, conn: sqlite3.Connection, llm: LLM,
+                 searcher: search_mod.Searcher | None = None) -> None:
         self.cfg = cfg
         self.conn = conn
         self.llm = llm
+        self.searcher = searcher or search_mod.Searcher(
+            cfg, emit=self.emit, client=getattr(llm, "shared_client", None))
         self.runs = 0
         self.aborts = 0
+        # Per-stage wall clock. The scheduler's timeout protects the stage; this
+        # is what tells us *where* the time went, which is the difference between
+        # "fetch is slow" and "the model is slow" in a way a human can act on.
+        self.last_stage_ms: dict[str, float] = {}
 
     def emit(self, type_: str, message: str, data: dict[str, Any] | None = None) -> None:
         db.emit(self.conn, type_, message=message, data=data or {})
 
-    # --- the prompt ------------------------------------------------------
+    # --- context ---------------------------------------------------------
+
+    def _context_blocks(self, task: db.Task) -> list[tuple[str, str]]:
+        """Everything this stage is allowed to read, as (source, text) pairs.
+
+        Fan-in lives here. `synthesize` is handed the files its dependencies
+        actually wrote, read back from disk by id: if an extract saved a cookie
+        wall, the synthesizer sees the cookie wall, and the artifact is wrong in a
+        way a human can diagnose rather than wrong in a way only a forensic
+        analyst could.
+        """
+        blocks: list[tuple[str, str]] = []
+        cap = int(self.cfg.get("research.source_context_chars", 2400))
+        payload = task.payload or {}
+
+        # Legacy/manual: a caller that hands us text directly.
+        if payload.get("context"):
+            blocks.append((str(payload.get("context_source", "retrieved")),
+                          str(payload["context"])[:cap]))
+
+        if task.kind == "extract":
+            src = payload.get("source") or {}
+            name = str(src.get("file") or "")
+            text = chains.read_scratch(self.cfg, task.chain_id, name) if name else ""
+            if not text:
+                blocks.append((str(src.get("url") or "source"),
+                              str(src.get("snippet") or "")[:cap]))
+            else:
+                blocks.append((str(src.get("url") or "source"), text[:cap]))
+
+        elif task.kind == "synthesize":
+            rows = self.conn.execute(
+                "SELECT id, kind, title, result_path, status FROM tasks WHERE id IN ({})"
+                .format(",".join("?" * len(task.dependencies))),
+                tuple(task.dependencies)).fetchall() if task.dependencies else []
+            for r in rows:
+                if r["status"] != db.SUCCEEDED or not r["result_path"]:
+                    continue
+                p = Path(str(r["result_path"]))
+                if not p.exists():
+                    # A succeeded stage whose file is gone is a real inconsistency
+                    # and belongs in the log, not silently skipped.
+                    self.emit("chain.missing_file",
+                            f"{r['kind']} {r['id'][:8]} saved nothing at {p.name}",
+                            {"task_id": task.id})
+                    continue
+                blocks.append((str(r["title"]), p.read_text(encoding="utf-8")[:cap]))
+
+        elif task.kind == "critique":
+            draft = payload.get("draft") or ""
+            if not draft and task.dependencies:
+                r = self.conn.execute(
+                    "SELECT result_path FROM tasks WHERE id=?",
+                    (task.dependencies[0],)).fetchone()
+                if r and r["result_path"] and Path(r["result_path"]).exists():
+                    draft = Path(r["result_path"]).read_text(encoding="utf-8")
+            if draft:
+                blocks.append(("draft under review", draft[:cap * 2]))
+
+        return blocks
 
     def prompt_for(self, task: db.Task) -> Request:
-        """Build the request. Secrets scanned in, retrieved context fenced.
-
-        `task.prompt` is authored here (CLI or a generator we wrote), so it is
-        scanned but not fenced. Anything under `payload["context"]` arrived from
-        outside — a web page, a file, another model — and is fenced even if it
-        reads innocently, because the whole point of the fence is that innocence
-        is not something we can check.
-        """
+        """Build the request. Secrets scanned in, retrieved context fenced."""
         body = task.prompt or (
             f"Produce a short, useful note on: {task.title}. "
             f"Be concrete; no preamble.")
@@ -87,27 +161,209 @@ class StageRunner:
                       f"span(s) from task prompt",
                       {"task_id": task.id, **scan.as_dict()})
         user = scan.text
-        ctx = task.payload.get("context")
-        if ctx:
-            inner = safety.scan_secrets(str(ctx), source=str(
-                task.payload.get("context_source", "payload")))
-            if not inner.blocked and inner.findings:
+        for source, text in self._context_blocks(task):
+            inner = safety.scan_secrets(text, source=source)
+            if inner.blocked:
+                self.emit("safety.withheld",
+                          f"context from {source} withheld (never-inline path)",
+                          {"task_id": task.id, **inner.as_dict()})
+                continue
+            if inner.findings:
                 self.emit("safety.redaction",
                           f"redacted {sum(f.count for f in inner.findings)} span(s) "
                           f"from retrieved context",
-                          {"task_id": task.id, **inner.as_dict()})
-            user += "\n\n" + safety.fence(
-                str(task.payload.get("context_source", "retrieved")), inner.text)
-        stage = task.kind
+                          {"task_id": task.id, "source": source,
+                           **inner.as_dict()})
+            user += "\n\n" + safety.fence(source, inner.text)
+        thinking = task.kind not in set(self.cfg.get("inference.thinking_off_stages",
+                                                      []) or [])
+        # Per-stage output budget. `synthesize` thinks for several hundred tokens
+        # before it writes anything, and a flat floor cuts its answer off
+        # mid-sentence — a truncated brief that reads as finished is worse than
+        # one that admits it ran out.
+        budgets = self.cfg.get("inference.stage_max_tokens", {}) or {}
+        budget = int(budgets.get(task.kind,
+                                  self.cfg.get("inference.max_tokens_floor", 512)))
         return Request(system=safety.SYSTEM_DATA_ONLY, user=user,
-                       thinking=self.llm.thinking_for(stage), kind=task.kind,
-                       stage=stage,
-                       max_tokens=int(self.cfg.get("inference.max_tokens_floor", 512)))
+                       thinking=thinking, kind=task.kind, stage=task.kind,
+                       max_tokens=budget)
 
-    # --- the stage -------------------------------------------------------
+    # --- dispatch --------------------------------------------------------
 
     async def __call__(self, task: db.Task) -> Outcome:
         self.runs += 1
+        if task.kind in FREE_KINDS:
+            return await self._free(task)
+        return await self._thinking(task)
+
+    # --- the free stages: network and disk, never the GPU --------------
+
+    async def _free(self, task: db.Task) -> Outcome:
+        t0 = time.perf_counter()
+        try:
+            if task.kind == "search":
+                out = await self._search(task, t0)
+            elif task.kind == "fetch":
+                out = await self._fetch(task, t0)
+            elif task.kind == "publish":
+                out = await self._publish(task, t0)
+            else:
+                out = Outcome(task.id, db.FAILED,
+                              reason=f"free kind {task.kind!r} unimplemented")
+                db.finish(self.conn, task.id, db.FAILED, error=out.reason)
+        except asyncio.CancelledError:
+            self.aborts += 1
+            self.emit("runner.cancelled",
+                      f"{task.generator}.{task.kind} (no GPU) cancelled after "
+                      f"{time.perf_counter() - t0:.2f}s",
+                      {"task_id": task.id, "search": self.searcher.state()})
+            raise
+        except Exception as exc:
+            self.emit("runner.failed", f"{task.kind}: {type(exc).__name__}: {exc}",
+                      {"task_id": task.id})
+            db.finish(self.conn, task.id, db.FAILED,
+                      error=f"{type(exc).__name__}: {exc}",
+                      duration_ms=(time.perf_counter() - t0) * 1000)
+            return Outcome(task.id, db.FAILED, reason=str(exc))
+        self.last_stage_ms[task.kind] = round((time.perf_counter() - t0) * 1000, 1)
+        return out
+
+    async def _search(self, task: db.Task, t0: float) -> Outcome:
+        queries = [str(q) for q in (task.payload.get("queries") or [])][:8]
+        if not queries:
+            reason = "no queries to run"
+            db.finish(self.conn, task.id, db.FAILED, error=reason,
+                      duration_ms=(time.perf_counter() - t0) * 1000)
+            self.emit("runner.failed", f"search: {reason}", {"task_id": task.id})
+            return Outcome(task.id, db.FAILED, reason=reason)
+        results: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        for q in queries:
+            # Sequential. Ten parallel fetches looks like an attack from the
+            # origin's side and is indistinguishable from one in your own logs.
+            for r in await self.searcher.search(q):
+                if r.url in seen_urls:
+                    continue
+                seen_urls.add(r.url)
+                results.append(r.as_dict())
+        db.merge_payload(self.conn, task.id, {"results": results})
+        db.finish(self.conn, task.id, db.SUCCEEDED if results else db.FAILED,
+                  error=None if results else "searxng returned nothing usable",
+                  duration_ms=(time.perf_counter() - t0) * 1000)
+        if not results:
+            self.emit("runner.failed", "search: no candidates",
+                      {"task_id": task.id, "search": self.searcher.state()})
+            return Outcome(task.id, db.FAILED, reason="no candidates")
+        self.emit("runner.stage",
+                  f"search: {len(queries)} queries -> {len(results)} candidates",
+                  {"task_id": task.id, "gpu": False,
+                   **self.searcher.state()})
+        kids = chains.advance(self.cfg, self.conn, task)
+        return Outcome(task.id, db.SUCCEEDED, children=tuple(k.id for k in kids))
+
+    async def _fetch(self, task: db.Task, t0: float) -> Outcome:
+        cap = int(self.cfg.get("research.max_sources", 4))
+        candidates = list(task.payload.get("candidates") or [])
+        if not candidates:
+            reason = "no candidates to fetch"
+            db.finish(self.conn, task.id, db.FAILED, error=reason,
+                      duration_ms=(time.perf_counter() - t0) * 1000)
+            return Outcome(task.id, db.FAILED, reason=reason)
+        sources: list[dict[str, Any]] = []
+        kept = 0
+        for cand in candidates:
+            # `cap` is a budget of *sources that worked*, not of candidates looked
+            # at. Stopping at cap examined means two 403s spend the whole budget
+            # and the chain dies with zero sources while candidates 3 and 4 sat
+            # unread — which is exactly the failure this stage exists to avoid.
+            if kept >= cap:
+                break
+            url = str(cand.get("url") or "")
+            page = await self.searcher.fetch(url)
+            entry = {"url": url,
+                    "title": str(cand.get("title") or url)[:120],
+                    "host": urlparse(url).hostname or "?",
+                    "status": page.status, "chars": len(page.text),
+                    "bytes": page.bytes_in, "truncated": page.truncated,
+                    "from_cache": page.from_cache, "ok": page.usable,
+                    "error": page.error}
+            if page.usable:
+                # Written per source so `extract` reads one page and pays one
+                # prefill, rather than every stage re-reading every page. Numbered
+                # by the kept count, because refused candidates now sit between
+                # usable ones and a gap in the numbering is a missing file.
+                name = f"source-{kept}.txt"
+                _, digest, size = await asyncio.to_thread(
+                    chains.write_scratch, self.cfg, task.chain_id, name, page.text,
+                    source=url)
+                entry["file"], entry["sha256"], entry["saved"] = name, digest, size
+                kept += 1
+            sources.append(entry)
+        db.merge_payload(self.conn, task.id, {"sources": sources})
+        usable_count = sum(1 for s in sources if s["ok"])
+        if usable_count == 0:
+            reason = f"0 of {len(sources)} candidates yielded usable text"
+            db.finish(self.conn, task.id, db.FAILED, error=reason,
+                      duration_ms=(time.perf_counter() - t0) * 1000)
+            self.emit("runner.failed", f"fetch: {reason}",
+                      {"task_id": task.id, "sources": sources})
+            return Outcome(task.id, db.FAILED, reason=reason)
+        db.finish(self.conn, task.id, db.SUCCEEDED,
+                  duration_ms=(time.perf_counter() - t0) * 1000)
+        self.emit("runner.stage",
+                  f"fetch: {usable_count}/{len(sources)} usable, "
+                  f"{sum(s['bytes'] for s in sources):,} bytes, no GPU",
+                  {"task_id": task.id, "gpu": False,
+                   "search": self.searcher.state()})
+        # advance fans out the extracts and builds the fan-in edge.
+        kids = chains.advance(self.cfg, self.conn, task)
+        return Outcome(task.id, db.SUCCEEDED, children=tuple(k.id for k in kids))
+
+    async def _publish(self, task: db.Task, t0: float) -> Outcome:
+        src = task.payload.get("draft_path")
+        if not src and task.dependencies:
+            r = self.conn.execute(
+                "SELECT result_path FROM tasks WHERE id=?",
+                (task.dependencies[0],)).fetchone()
+            src = r["result_path"] if r else None
+        # Off the loop. A draft is a few kilobytes today, and the day the chain
+        # synthesises a 2 MB review of a monorepo is the day a blocked loop
+        # misses the preemption tick that was supposed to free the GPU.
+        text = await asyncio.to_thread(read_text_if_any, src) \
+            if src else ""
+        if not text.strip():
+            reason = "nothing to publish"
+            db.finish(self.conn, task.id, db.FAILED, error=reason,
+                      duration_ms=(time.perf_counter() - t0) * 1000)
+            self.emit("runner.failed", f"publish: {reason}", {"task_id": task.id})
+            return Outcome(task.id, db.FAILED, reason=reason)
+        scan = safety.scan_secrets(text, source=f"publish:{task.title[:40]}")
+        if scan.findings:
+            self.emit("safety.redaction",
+                      f"redacted {sum(f.count for f in scan.findings)} span(s) "
+                      f"at publish", {"task_id": task.id, **scan.as_dict()})
+        day = chains.day_dir(self.cfg)
+        target = day / f"{slug_dirname(task)}.md"
+        digest = hashlib.sha256(scan.text.encode()).hexdigest()
+        # The write and the finish are ordered deliberately: the file exists and
+        # is hashed before the row claims it does. The other order leaves a row
+        # pointing at a file that is not there yet, which `synthesize` reads back
+        # as an empty document and publishes as a confident nothing.
+        await asyncio.to_thread(write_text, target, scan.text)
+        db.finish(self.conn, task.id, db.SUCCEEDED, result_path=str(target),
+                  result_hash=digest,
+                  duration_ms=(time.perf_counter() - t0) * 1000)
+        register_artifact(self.conn, task, str(target), digest, status="PUBLISHED")
+        self.emit("runner.published",
+                  f"{task.generator}: {target.name} "
+                  f"({len(scan.text)} chars, no GPU)",
+                  {"task_id": task.id, "path": str(target), "gpu": False})
+        chains.advance(self.cfg, self.conn, task)
+        return Outcome(task.id, db.SUCCEEDED, path=str(target))
+
+    # --- the thinking stages ----------------------------------------------
+
+    async def _thinking(self, task: db.Task) -> Outcome:
         t0 = time.perf_counter()
         try:
             req = self.prompt_for(task)
@@ -126,10 +382,10 @@ class StageRunner:
         try:
             comp = await self.llm.stream(req)
         except asyncio.CancelledError:
-            # Record, then propagate. The accounting matters: without it the
-            # events table shows a stage that vanished, and a GPU that was busy
-            # for nine seconds with nothing to show for it looks like a bug in
-            # the meter rather than an aborted request, which is what it was.
+            # Record, then propagate. Without the accounting the events table
+            # shows a stage that vanished and a GPU busy for nine seconds with
+            # nothing to show for it, which reads as a metering bug rather than
+            # the preemption it was.
             self.aborts += 1
             self.emit("runner.cancelled",
                       f"{task.generator}.{task.kind} cancelled after "
@@ -150,7 +406,6 @@ class StageRunner:
             return Outcome(task.id, db.FAILED, reason=str(exc), completion=comp)
 
         if not comp.usable:
-            # Reasoning with no answer (§4): the model spent the budget thinking.
             reason = f"no content (finish={comp.finish_reason}, " \
                      f"reasoning={len(comp.reasoning)}c)"
             db.finish(self.conn, task.id, db.FAILED, error=reason,
@@ -167,52 +422,56 @@ class StageRunner:
             self.emit("safety.injection_flags",
                       f"{task.kind} output carries instruction-shaped text: "
                       f"{', '.join(flags)}", {"task_id": task.id})
-        name = f"{task.generator}-{task.kind}.md"
         doc = self.document(task, comp, flags)
         try:
-            # Off the loop. The write is small, but "small" is a claim about the
-            # average artifact and the daemon is not allowed to bet the preemption
-            # path on an average: a 20MB log pasted into a doc would stall the
-            # tick that frees the GPU.
             path, digest = await asyncio.to_thread(
-                safety.write_workspace_file, self.cfg, task.id, name, doc)
+                safety.write_workspace_file, self.cfg, task.id,
+                f"{task.generator}-{task.kind}.md", doc)
         except safety.PathRefused as exc:
             db.finish(self.conn, task.id, db.FAILED, error=str(exc))
             return Outcome(task.id, db.FAILED, reason=str(exc), completion=comp)
+
+        payload_patch: dict[str, Any] = {}
+        if task.kind == "synthesize":
+            payload_patch["draft_path"] = str(path)
+        if payload_patch:
+            db.merge_payload(self.conn, task.id, payload_patch)
 
         db.finish(self.conn, task.id, db.SUCCEEDED, result_path=str(path),
                   result_hash=digest, input_tokens=comp.prompt_tokens,
                   output_tokens=comp.completion_tokens,
                   ttft_ms=(comp.ttft_s or 0) * 1000,
                   duration_ms=comp.elapsed_s * 1000)
-        self.conn.execute(
-            "INSERT OR REPLACE INTO artifacts (id, task_id, generator, title, path,"
-            " hash, score, scores_json, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (db.new_id(), task.id, task.generator, task.title, str(path), digest,
-             None, None, "CANDIDATE", db.now()))
-        self.conn.commit()
-        self.emit("runner.published",
+        register_artifact(self.conn, task, str(path), digest, status="CANDIDATE")
+        self.emit("runner.stage",
                   f"{task.generator}.{task.kind} -> {path.name} "
                   f"({len(comp.text)} chars, {comp.completion_tokens} tok, "
-                  f"{comp.elapsed_s:.1f}s)",
-                  {"task_id": task.id, "path": str(path), **comp.as_dict()})
-        return Outcome(task.id, db.SUCCEEDED, path=str(path), completion=comp)
+                  f"{comp.elapsed_s:.1f}s, usage={comp.usage_source})",
+                  {"task_id": task.id, "path": str(path), "gpu": True,
+                   **comp.as_dict()})
+        kids = chains.advance(self.cfg, self.conn, task, result_text=comp.text)
+        self.last_stage_ms[task.kind] = round((time.perf_counter() - t0) * 1000, 1)
+        return Outcome(task.id, db.SUCCEEDED, path=str(path), completion=comp,
+                       children=tuple(k.id for k in kids))
 
     # --- the document ----------------------------------------------------
 
     def document(self, task: db.Task, comp: Completion,
                  flags: tuple[str, ...]) -> str:
-        """The artifact. Header carries provenance and accounting, because an
-        output with no record of what it cost and what it read is not auditable."""
+        """The artifact. The header carries provenance and accounting, because an
+        output with no record of what it cost is not auditable."""
         lines = [
             f"# {task.title}",
             "",
             f"- generator: `{task.generator}`  kind: `{task.kind}`",
             f"- task: `{task.id}`  chain: `{task.chain_id}`",
             f"- model: `{self.llm.model}`  {comp.elapsed_s:.1f}s, "
-            f"TTFT {(comp.ttft_s or 0) * 1000:.0f}ms",
+            f"TTFT {(comp.ttft_s or 0) * 1000:.0f}ms ({comp.usage_source}), "
+            f"finished: {comp.finish_reason or '?'}",
             f"- tokens: {comp.prompt_tokens} in / {comp.completion_tokens} out",
         ]
+        if comp.gen_tps:
+            lines.append(f"- speed: {comp.gen_tps:.0f} tok/s decode")
         if flags:
             lines.append(f"- **injection flags (not blocked, flagged):** "
                          f"{', '.join(flags)}")
@@ -220,7 +479,53 @@ class StageRunner:
             lines += ["", "## reasoning (excerpt)", "",
                       comp.reasoning[:600].strip(), ""]
         lines += ["## result", "", comp.text.strip(), ""]
+        if comp.finish_reason == "length":
+            # Loud, in the artifact, not in a log nobody reads: a truncated answer
+            # that looks complete is the failure mode of every summariser ever
+            # written, and the reader deserves to know.
+            lines += ["", "> **truncated**: the model hit its output budget "
+                       f"({comp.completion_tokens} tokens). Raise "
+                       "`inference.stage_max_tokens` for this stage or narrow the "
+                       "subject.", ""]
         return "\n".join(lines)
 
     def state(self) -> dict[str, Any]:
-        return {"runs": self.runs, "aborts": self.aborts, **self.llm.state()}
+        return {"runs": self.runs, "aborts": self.aborts,
+                "stage_ms": self.last_stage_ms,
+                "search": self.searcher.state(), **self.llm.state()}
+
+
+def read_text_if_any(path: str | Path | None) -> str:
+    """Read a file that might not exist. Its own function so it can be handed to
+    `to_thread` without a lambda wrapping a conditional, which is how a blocking
+    read hides inside an async function."""
+    if not path:
+        return ""
+    p = Path(str(path))
+    if not p.exists():
+        return ""
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def slug_dirname(task: db.Task) -> str:
+    return f"{chains.slug(task.payload.get('topic') or task.title)}"
+
+
+def register_artifact(conn: sqlite3.Connection, task: db.Task, path: str,
+                      digest: str, *, status: str = "CANDIDATE") -> None:
+    """Record an artifact. `CANDIDATE` is what a thinking stage produces: it
+    exists, it is readable, and nothing has judged it yet. `publish` promotes it.
+    A stage that wrote a file and recorded nothing is an artifact that never
+    appears in the kitchen, which is the same as not having done the work."""
+    conn.execute(
+        "INSERT OR REPLACE INTO artifacts (id, task_id, generator, title, path,"
+        " hash, score, scores_json, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (db.new_id(), task.id, task.generator, task.title, path, digest, None,
+         None, status, db.now()))
+    conn.commit()
+

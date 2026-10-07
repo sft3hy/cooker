@@ -226,6 +226,36 @@ def tls_context(ca_file: str | None):
     return ssl.create_default_context(cafile=str(p)) if p and p.exists() else True
 
 
+def tls_context_with_roots(ca_file: str | None):
+    """Public roots PLUS the private step CA, in one trust store.
+
+    `tls_context()` above is for clients that only ever speak to `*.home.arpa`:
+    `create_default_context(cafile=...)` *replaces* the trust store, so a client
+    built that way fails every real internet certificate with "unable to get local
+    issuer certificate" — and the failure looks exactly like the site being down,
+    which is how this first showed up: a research chain where every fetch failed
+    and nothing said "certificate".
+
+    Both stores are needed by anything that reads the web through a home.arpa
+    proxy, because the search engine is on the LAN and the pages it returns are
+    not.
+    """
+    import ssl
+
+    ctx = ssl.create_default_context()
+    ctx.load_default_certs()
+    try:
+        import certifi
+
+        ctx.load_verify_locations(cafile=certifi.where())
+    except Exception:
+        pass
+    p = Path(ca_file).expanduser() if ca_file else None
+    if p and p.exists():
+        ctx.load_verify_locations(cafile=str(p))
+    return ctx
+
+
 class Resolver:
     """Finds and caches the working inference endpoint.
 

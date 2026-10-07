@@ -273,6 +273,56 @@ when it reported neither. A zero is treated as "not reported" and never stored a
 cost, because a recorded zero reads as a fact and is indistinguishable from never
 having measured.
 
+## 13. What the real web does to a research chain (bench #9)
+
+M4 ran the chain end-to-end against live SearXNG and live omlx. Seven stages,
+7/7 succeeded, one 3,497-character artifact. Four of the bugs it found were
+invisible in unit tests because the tests were not the internet.
+
+**`create_default_context(cafile=step_ca)` replaces the trust store.** The same
+client talks to `searxng.home.arpa` (private step CA) and to the pages it returns
+(real certificates). Pointed only at the private CA, *every* public fetch failed
+`CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate` — and because
+that arrives as a `ConnectError`, the chain reported "0 of 2 candidates yielded
+usable text", which reads like the site being down and never mentions
+certificates. Fixed by loading public roots *and* the step CA into one context.
+
+**A host guard written with string equality is not a guard.** `host ==
+"127.0.0.1"` admits the rest of 127.0.0.0/8, and `urlparse().netloc.split(":")`
+on an IPv6 URL returns the string `"["`, which matches nothing. Both replaced by
+`ipaddress` ranges behind a `search.allow_private_networks` knob, default off.
+
+**Origins refuse, constantly.** In one run: 403 from mdpi.com, 429 from
+docs.vllm.ai. Two consequences designed in: a 403/429/503 puts the *host* in
+cooldown honouring `Retry-After`, and `max_sources` counts **kept** sources rather
+than **examined** candidates — the original `if len(sources) >= cap: break` meant
+two refusals spent the entire budget and the chain died with zero sources while
+candidates three and four sat unread.
+
+**A flat output budget truncates silently.** `max_tokens: 512` for every stage,
+with thinking on, gave `finish_reason=length` mid-sentence and an artifact that
+looked finished. Measured: `synthesize` needs ~1,400, `critique` ~1,200,
+`extract` ~700, `plan` ~64. Per-stage budgets now, and `length` is stamped into
+the document itself.
+
+### The cost of one real research chain
+
+| stage | in | out | wall | GPU |
+|---|---|---|---|---|
+| plan | 200 | 64 | 1.0s | yes |
+| search | — | — | 1.2s | no |
+| fetch | — | — | 1.8s | no |
+| extract | 489 | 526 | 3.2s | yes |
+| synthesize | 610 | 1,363 | 7.7s | yes |
+| critique | 832 | 1,218 | 7.5s | yes |
+| publish | — | — | 0.0s | no |
+
+~24 s wall, 4 GPU stages, ~2,100 tokens. The largest prefill seen was **917
+tokens under the 1,000 ceiling** — with `source_context_chars: 1200` and
+`max_sources: 2`. That ceiling is not hypothetical headroom: `fit()` is what keeps
+a chain with four 2,400-character sources from turning `synthesize` into a 2k
+prefill, which §E measured at 3.0x idle TTFT.
+
 ## Open question, deliberately deferred
 
 **Does a hard abort mid-prefill eventually free the accelerator sooner than the
