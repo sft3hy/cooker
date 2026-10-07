@@ -331,27 +331,40 @@ def create_task(
     )
 
 
-_CLAIM_SQL = f"""
-    UPDATE tasks
-       SET status = '{RUNNING}',
-           started_at = :now,
-           attempts = attempts + 1
-     WHERE id = (
-             SELECT t.id
-               FROM tasks t
-              WHERE t.status = '{QUEUED}'
-                AND t.not_before <= :now
-                AND NOT EXISTS (
-                      SELECT 1
-                        FROM json_each(t.dependencies) d
-                        LEFT JOIN tasks p ON p.id = d.value
-                       WHERE p.id IS NULL OR p.status NOT IN {_in_sql(DEPS_SATISFIED)}
-                )
-              ORDER BY t.priority ASC, t.not_before ASC, t.created_at ASC
-              LIMIT 1
-           )
-    RETURNING *
-"""
+# --- the runnable predicate, defined once -------------------------------
+# claim_next, peek_runnable, next_runnable_eta and runnable_now all need to
+# answer "is this stage claimable if the clock says so?". Four hand-copied
+# versions of that predicate is a bug waiting to happen: "peek says runnable but
+# claim says no" is a race that only appears under load and reads as a phantom
+# stall. All of them require `tasks` aliased as t.
+_DEPS_OK = (
+    "NOT EXISTS ("
+    "  SELECT 1 FROM json_each(t.dependencies) d"
+    "  LEFT JOIN tasks p ON p.id = d.value"
+    f"  WHERE p.id IS NULL OR p.status NOT IN {_in_sql(DEPS_SATISFIED)})"
+)
+
+_ORDER = "ORDER BY t.priority ASC, t.not_before ASC, t.created_at ASC"
+
+
+def _claim_sql(generators: list[str] | None) -> tuple[str, dict[str, Any]]:
+    """Build the claim statement. Built rather than `.replace()`d on purpose:
+    str.replace edits *every* occurrence, so a second QUEUED predicate anywhere in
+    the statement would get the generator filter bolted onto it too."""
+    extra, params = "", {}
+    if generators:
+        ph = ",".join(f":g{i}" for i in range(len(generators)))
+        extra = f" AND t.generator IN ({ph})"
+        params = {f"g{i}": g for i, g in enumerate(generators)}
+    params["now"] = now()
+    sql = (
+        f"UPDATE tasks SET status = '{RUNNING}', started_at = :now,"
+        " attempts = attempts + 1 WHERE id = ("
+        f"  SELECT t.id FROM tasks t WHERE t.status = '{QUEUED}'"
+        f"    AND t.not_before <= :now{extra} AND {_DEPS_OK} {_ORDER} LIMIT 1)"
+        " RETURNING *"
+    )
+    return sql, params
 
 
 def claim_next(conn: sqlite3.Connection, *, generators: list[str] | None = None) -> Task | None:
@@ -365,17 +378,8 @@ def claim_next(conn: sqlite3.Connection, *, generators: list[str] | None = None)
         try:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                if generators:
-                    placeholders = ",".join(f":g{i}" for i in range(len(generators)))
-                    sql = _CLAIM_SQL.replace(
-                        "WHERE t.status = 'QUEUED'",
-                        f"WHERE t.status = 'QUEUED' AND t.generator IN ({placeholders})",
-                    )
-                    params: dict[str, Any] = {f"g{i}": g for i, g in enumerate(generators)}
-                    params["now"] = now()
-                    row = conn.execute(sql, params).fetchone()
-                else:
-                    row = conn.execute(_CLAIM_SQL, {"now": now()}).fetchone()
+                sql, params = _claim_sql(generators)
+                row = conn.execute(sql, params).fetchone()
                 conn.execute("COMMIT")
             except BaseException:
                 conn.execute("ROLLBACK")
@@ -387,6 +391,17 @@ def claim_next(conn: sqlite3.Connection, *, generators: list[str] | None = None)
                 continue
             raise
     return None
+
+
+def peek_runnable(conn: sqlite3.Connection, limit: int = 8) -> list[Task]:
+    """The rows claim_next would take, without taking them. Lets the dry-run
+    scheduler point at real queued work instead of inventing any."""
+    rows = conn.execute(
+        f"SELECT t.* FROM tasks t WHERE t.status = '{QUEUED}'"
+        f" AND t.not_before <= ? AND {_DEPS_OK} {_ORDER} LIMIT ?",
+        (now(), limit),
+    ).fetchall()
+    return [Task.from_row(r) for r in rows]
 
 
 def finish(
@@ -480,6 +495,25 @@ def propagate_blocked(conn: sqlite3.Connection) -> int:
     return cur.rowcount or 0
 
 
+# --- meta (daemon-to-CLI handoff) ---------------------------------------
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    """A durable note the CLI can leave for the running daemon. `cooker pause`
+    writes one; the scheduler reads it every tick. A file in the DB rather than
+    a signal, so it survives a restart and a closed terminal."""
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
+
+def get_meta(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
 # --- reporting ----------------------------------------------------------
 
 
@@ -490,27 +524,22 @@ def queue_counts(conn: sqlite3.Connection) -> dict[str, int]:
 
 def next_runnable_eta(conn: sqlite3.Connection) -> float | None:
     """When the next *claimable-if-time-passed* stage stops waiting, or None if
-    nothing is queued at all. Ignores stages blocked on dependencies: waiting on
-    a dependency is not a timer, and reporting a bogus ETA there is how a HUD
+    nothing is claimable at all. Ignores stages blocked on dependencies: waiting
+    for a dependency is not a timer, and inventing an ETA for one is how a HUD
     starts lying."""
     row = conn.execute(
-        f"SELECT MIN(t.not_before) AS nb FROM tasks t WHERE t.status='{QUEUED}'"
-        " AND NOT EXISTS ("
-        "  SELECT 1 FROM json_each(t.dependencies) d"
-        "  LEFT JOIN tasks p ON p.id=d.value"
-        f"  WHERE p.id IS NULL OR p.status NOT IN {_in_sql(DEPS_SATISFIED)})",
+        f"SELECT MIN(t.not_before) AS nb FROM tasks t"
+        f" WHERE t.status = '{QUEUED}' AND {_DEPS_OK}",
     ).fetchone()
     return float(row["nb"]) if row is not None and row["nb"] is not None else None
 
 
 def runnable_now(conn: sqlite3.Connection) -> int:
-    """Queued stages whose dependencies are met and whose backoff has expired."""
+    """Queued stages whose dependencies are met and whose backoff has expired:
+    'what could be claimed this instant', a different question from the ETA."""
     row = conn.execute(
-        f"SELECT COUNT(*) AS n FROM tasks t WHERE t.status='{QUEUED}'"
-        f" AND t.not_before <= ? AND NOT EXISTS ("
-        "  SELECT 1 FROM json_each(t.dependencies) d"
-        "  LEFT JOIN tasks p ON p.id=d.value"
-        f"  WHERE p.id IS NULL OR p.status NOT IN {_in_sql(DEPS_SATISFIED)})",
+        f"SELECT COUNT(*) AS n FROM tasks t WHERE t.status = '{QUEUED}'"
+        f" AND t.not_before <= ? AND {_DEPS_OK}",
         (now(),),
     ).fetchone()
     return int(row["n"])

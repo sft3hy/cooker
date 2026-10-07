@@ -63,15 +63,16 @@ Single process means the UI is exactly as available as the daemon — acceptable
 
 | Signal | Source | Cadence | Tells us |
 |---|---|---|---|
-| `infer_clients` | `lsof -nP -iTCP:8000 -sTCP:ESTABLISHED`, filter rows whose *peer* is the omlx server PID, drop our own PID | 1 s | OpenCode/autoresearch/curl is generating **now** |
+| `wire` | `nettop -n -x -P -L 2 -s 1`, bytes moved by the **omlx server pid** in the window | 2 s poll | inference is happening **now**. NOT the socket: an ESTABLISHED :8000 peer is a keepalive that lasts for hours at exactly 0 bytes (DISCOVERY §11) |
+| `infer_clients` | `lsof -nP -iTCP:8000 -sTCP:ESTABLISHED`, drop shadow addrs and our own PID | 2 s | names *who is connected*. It is an address book, not a trigger — it cannot distinguish generating from idle |
 | `hid_idle` | `ioreg -arc IOHIDSystem -k HIDIdleTime` (text parse) | 2 s | typing/mouse in the last N seconds |
 | `opencode_live` | ESTABLISHED → `127.0.0.1:4096`, plus `opencode.db-wal` mtime age | 2 s | an OpenCode session is open and writing |
 | `fs_activity` | max mtime of `~/dev/*` + `~/homelab/*` depth-2 dirs and `.git/index` | 5 s | files were just saved |
-| `llm_sidechannel` | mtime of `~/.omlx/stats.json`, delta of `usage.sqlite3` hourly row | 5 s | inference happened recently even if we missed the socket |
+| `llm_sidechannel` | mtime of `~/.omlx/stats.json` | 5 s | **demoted:** three real 200s moved neither the counters nor the mtime. Daily accounting only (§11) |
 | `load` | `ps -Ao comm,%cpu` sums for `omlx`/`opencode` | 5 s | corroborating pressure signal |
 
 **State, strictest wins:**
-- `ACTIVE_INFER` — any ESTABLISHED :8000 peer that is not Cooker → **abort our in-flight request immediately**, start the cooldown clock.
+- `ACTIVE_INFER` — **omlx itself moved ≥ `infer_min_bps` in the wire window** → abort our in-flight request immediately, start the cooldown clock. A connected-but-silent peer is `IDLE` with reason `keepalive: …`, deliberately *not* ACTIVE_INFER: if a keepalive latched the state, the kitchen would never light (§11). If nettop is not running the state is `ACTIVE_USER` with reason `blind: …` — finish what is in flight, start nothing, because 0 and unknown are different answers.
 - `ACTIVE_USER` — `hid_idle < user_idle_seconds` (default 120) **or** OpenCode WAL written in the last 30 s **or** `fs_activity < 60 s` → **do not start new stages**; let the current stage finish (bounded by `max_stage_seconds`) so work isn't thrown away. Typing is not the same as generating, so this is deliberately less twitchy than `ACTIVE_INFER`.
 - `IDLE` — none of the above held for `idle_confirm_seconds` (default 60) → ramp workers toward `max_concurrency`.
 
@@ -185,4 +186,4 @@ Each milestone is independently useful and shippable. One at a time.
 ## 12. Open questions I'll resolve with measurement, not opinion
 1. Where does the prefill ladder put the safe ceiling — 2k? 4k? (`DISCOVERY.md` §E)
 2. Does `lsof` at 1 s cadence cost enough to matter on this box? (measured in M2)
-3. Does `usage.sqlite3` commit frequently enough to be a usable inference signal, or is it hourly-only (its PK suggests hourly → probably useless live, useful for daily accounting).
+3. ~~Does `usage.sqlite3` commit frequently enough to be a usable inference signal?~~ **Answered:** no. Neither it nor `stats.json` moved across three successful generations; `nettop` bytes per pid is the signal, at 0 vs 5,376 B/s separation (§11).

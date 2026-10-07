@@ -16,6 +16,47 @@ detect:
   # connect (inference.base_url). omlx listens on :8000 on every interface.
   omlx_port: 8000
   omlx_proc_names: [omlx, omlx-server]
+  # Per-signal cadence. Set from measurement, not guess (DISCOVERY.md / the
+  # cost table in detect.py): lsof costs ~190ms of CPU per call, so the socket
+  # probe is ONE combined LISTEN+ESTABLISHED query per second and the rest ride
+  # slower cadences. `fs` is a 4ms in-process stat scan, so it is cheap here.
+  cadence_seconds:
+    # 2s, not 1s: since bench #7 the sockets probe names the peers and the wire
+    # decides whether they are generating, so a half-second of staleness in the
+    # address book costs nothing. At 1 Hz this single probe cost 23% of a core on
+    # a 28-core Studio, which is not "polite" for a sidecar watching nothing happen.
+    sockets: 2.0
+    hid: 2.0
+    wal: 2.0
+    oc_socks: 5.0
+    fs: 5.0
+    side: 5.0
+    load: 5.0
+    # Reading the wire is a dict lookup: the cost is paid once, by the resident
+    # nettop, so this rides the tick cadence rather than a slow lane.
+    wire: 1.0
+  fs_roots:
+    - ~/dev
+    - ~/homelab
+  llm_stats_file: ~/.omlx/stats.json
+  # --- bytes are the proof of inference (cooker/wire.py, bench #7) ---------
+  # A socket is a relationship; OpenCode and Traefik hold one open on :8000 for
+  # hours at zero throughput, so `lsof ESTABLISHED` cannot be the trigger for
+  # ACTIVE_INFER or this daemon would never cook. Throughput is. One resident
+  # nettop samples per interval, and a peer counts as generating if it moved
+  # bytes anywhere inside the window.
+  # 2.0s poll period. Each poll is a short nettop that costs ~1.2s of wall time
+  # (a second of it is nettop's own sleep) and a few ms of CPU. A new external
+  # generation is therefore noticed within ~2s, which is polite enough given the
+  # prefill ceiling already bounds what we can be doing when it arrives.
+  wire_interval_seconds: 2.0
+  wire_window_seconds: 3.0
+  # Calibrated, not picked: measured silence is exactly 0 B/s and one real
+  # streamed reply was 6,683 B/s, so 256 sits two orders below the traffic and
+  # comfortably above keepalive noise. Too high and we cook over a generation;
+  # too low and a stray ACK freezes the kitchen.
+  infer_min_bps: 256
+  load_proc_names: [omlx, opencode]
   # Ordered URLs to try, best first. https/home.arpa beats raw IPs, which
   # beat loopback (occupied by a stray http.server on this host).
   base_url_candidates:

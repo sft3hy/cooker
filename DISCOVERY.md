@@ -180,6 +180,62 @@ the everyday cancellable pipeline.
 
 ---
 
+## 11. A socket is not a generation — bytes are (bench #7)
+
+This is the finding that rewrote the detector, and it was expensive to find because
+the wrong signal fails silently: `lsof` answers confidently, and the answer is wrong.
+
+Measured 2026-10-07, in windows where a tool was executing and no tokens were being
+produced:
+
+| candidate signal | measured behaviour | verdict |
+| --- | --- | --- |
+| `lsof -iTCP:8000 -sTCP:ESTABLISHED` | 2-6 connections, permanently. Traefik keeps an upstream alive, OpenCode keeps a pool | **useless as a trigger.** A socket is a relationship, not an event. As the ACTIVE_INFER trigger it latches forever and the kitchen never lights |
+| omlx cumulative `cputime` | 3.90 CPU-seconds inside a 4.05 second window serving nothing: the server busy-spins | **useless.** Busy does not imply busy *with inference* |
+| `ps -o %cpu` | a decayed average: 0.7% and 110% from the same spin, tens of seconds apart | **useless live.** Answers a question about ten seconds ago |
+| `~/.omlx/stats.json` | three successful HTTP 200s moved neither the counters nor the mtime | dead as a live signal; fine for nightly accounting |
+| `nettop` bytes per pid | exactly `0` with the sockets wide open; `10,752` bytes in a 2s window on one real streamed reply | **the signal.** Two orders of magnitude of separation, and it goes back to zero |
+
+So `ACTIVE_INFER := omlx itself moved bytes in the last window`. The trigger is the
+*server's* throughput rather than a peer's, because on this box requests arrive
+through Traefik in OrbStack: the process named on the socket is the proxy's, not the
+caller's, so attributing a request to a command name would be a guess while bytes
+leaving omlx is a fact. `cooker/wire.py` implements it and
+`bench/bench7_generate_vs_keepalive.py` re-runs the measurement.
+
+Three sub-findings, each of which produced a plausible wrong number rather than a
+crash:
+
+**nettop buffers a piped stdout.** A resident `nettop -L 0` delivered its first line
+**8.22s** after start and the next batch **8s later**: libc block-buffers stdout when
+it is not a terminal. A resident probe therefore has an eight second blind spot on the
+one question the daemon exists to answer fast. Short `nettop -L 2 -s 1` runs return in
+**1.25s**, consistently, and print two cumulative samples so the diff is still honest.
+The probe polls rather than streams.
+
+**`os.times()` indices.** Indices 0 and 1 are this process's own user/sys time;
+subprocesses are 2 and 3. Reading 0 and 1 reported `0.04 cores` for a `cooker watch`
+run that actually cost `1.01`, because the daemon is nearly idle and its children are
+not. `os.wait4()` gives a specific child's rusage and is what the probe uses.
+
+**Probe cost is not additive.** nettop run alone in a shell costs ~60ms CPU. Inside
+the detector, with lsof, ioreg and `ps -Axo` walking the same kernel tables
+concurrently, the same run measured ~1,590ms. Per-probe figures in the cost table are
+therefore indicators; the whole-process line is the number to trust. `cooker watch`
+prints both, and says so when they disagree by enough to matter.
+
+Whole `cooker watch`: **16.3s CPU over 16.2s wall = 1.01 cores = 3.4% of 30 cores**,
+of which 15.7s is subprocesses. `lsof` remains the expensive one, so the socket probe
+dropped from 1 Hz to 0.5 Hz (23% -> 11.5% of a core) now that it only names peers
+rather than deciding state.
+
+**Consequence for the state machine.** Connected-and-silent is now `IDLE` with the
+reason `keepalive: OrbStack Helper`, not `ACTIVE_INFER`. That single change is the
+difference between a sidecar that cooks and a daemon that only ever says no. And blind
+is its own answer: if nettop is not running, the reason is `blind: no throughput
+data, cannot tell 0 from unknown` and the state is `ACTIVE_USER` — finish what is in
+flight, start nothing — rather than either guess.
+
 ## Open question, deliberately deferred
 
 **Does a hard abort mid-prefill eventually free the accelerator sooner than the
@@ -200,4 +256,7 @@ clean win, raising the ceiling is a one-line config change.
 | stable endpoint (§6) | `inference.base_url` | `https://omlx.home.arpa/v1` |
 | throttled rollout | `scheduler.max_concurrency` | `1` |
 | no queue API (§7) | `detect.*` | socket + HID + WAL polling |
+| bytes not sockets (§11) | `detect.wire_interval_seconds`, `wire_window_seconds` | `2.0`, `3.0` |
+| quiet/busy separation (§11) | `detect.infer_min_bps` | `256` (measured 0 vs 5,376 B/s) |
+| sockets only name peers (§11) | `detect.cadence_seconds.sockets` | `2.0` (was 1.0, 23% -> 11.5% of a core) |
 | hysteresis everywhere | `detect.interactive_cooldown_seconds`, `idle_confirm_seconds` | `60`, `60` |
