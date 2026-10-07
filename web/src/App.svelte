@@ -72,11 +72,28 @@
     // The canvas scene: map the API payload to what the renderer draws.
     if (!state) return { pots: [], state: 'OFFLINE', busy: false };
     const g = state.gate || {};
-    const busy = g.state !== 'IDLE' && !g.stale ? true : g.busy;
+    const busy = g.stale ? false : g.state !== 'IDLE';
+    let banner;
+    if (g.stale) {
+      banner = 'daemon detached — last known state';
+    } else if (g.state === 'ACTIVE_INFER') {
+      banner = 'paused — someone is generating';
+    } else if (g.state === 'ACTIVE_USER') {
+      banner = 'waiting — activity on the box';
+    } else if ((state.workers?.slots || []).length) {
+      banner = `cooking — ${state.workers.slots.length} stage(s) on`;
+    } else if (g.ready && !g.ramped) {
+      banner = `one pot — ${(g.ramp_note || 'ramping').slice(0, 24)}`;
+    } else if (g.ready) {
+      banner = 'ready — filling the queue';
+    } else {
+      banner = `quiet ${(g.quiet_s ?? 0).toFixed(0)}s of ${(g.ready_in_s || 4).toFixed(0)}`;
+    }
     return {
       pots: state.pots,
       state: g.stale ? 'OFFLINE?' : g.state,
       busy: busy || g.state === 'ACTIVE_INFER',
+      banner,
       note: (g.reason || '').slice(0, 46),
       digestWritten: state.digest?.written,
       platedToday: state.today?.published ?? 0,
@@ -96,8 +113,11 @@
   function onClick(e) {
     unlock();
     const rect = canvas.getBoundingClientRect();
-    const mx = (e.clientX - rect.left) / scale;
-    const my = (e.clientY - rect.top) / scale;
+    // logical coords from the *rendered* rect, not the assumed scale: if a
+    // font load or zoom nudged the layout between frames, the rect is still
+    // the truth and a stale `scale` is not.
+    const mx = (e.clientX - rect.left) * (W / rect.width);
+    const my = (e.clientY - rect.top) * (H / rect.height);
     const gen = hitTestPot(mx, my);
     if (gen) {
       drawer = gen;
@@ -122,6 +142,10 @@
   onMount(async () => {
     computeScale();
     window.addEventListener('resize', computeScale);
+    // fonts change metrics and the fit is arithmetic on them; redraw is every
+    // frame anyway, but re-fitting after the pixel font lands keeps the
+    // integer scale honest.
+    if (document.fonts?.ready) document.fonts.ready.then(computeScale);
     await refreshState();
     connect();
     pollTimer = setInterval(refreshState, 4000);
@@ -278,6 +302,13 @@
     --red: #e05252;
     --green: #6fcf7c;
   }
+  /* The preload in index.html is nothing without this declaration — the font
+     silently fell back to 8px monospace, which is how the kitchen came to
+     look "wonky": every canvas label was drawing in a font that never
+     loaded. (The @font-face itself lives in index.html, not here: Vite
+     resolves url() in bundled CSS relative to /assets/, and public/ is not
+     under /assets/. A path that works in dev and 404s in prod is the worst
+     kind of works-on-my-machine.) */
   :global(body) {
     margin: 0;
     background: var(--bg);
@@ -319,8 +350,12 @@
     image-rendering: crisp-edges;
     border: 4px solid #322640;
     background: #241c2e;
-    max-width: 100%;
     cursor: pointer;
+    /* no max-width here on purpose: `width:{W*scale}px` with an integer
+       scale already fits — computeScale floors to the container. A max-width
+       that re-shrinks the canvas turns the integer scale back into a
+       fractional one, and fractional is exactly the smear we declared war
+       on. */
   }
   .hud { margin: 4px 0 10px; }
   .badge {

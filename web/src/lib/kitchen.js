@@ -127,12 +127,21 @@ function drawRoom(ctx, st, t) {
   }
   text(ctx, `${plates} today`, 296, 44 + 14, PAL.dim, 8);
 
-  // Counter
+  // counter
   rect(ctx, 0, 162, W, 8, PAL.counterTop);
   rect(ctx, 0, 170, W, 2, PAL.counterEdge);
   rect(ctx, 0, 172, W, 74, PAL.counter);
   for (let x = 8; x < W; x += 48) rect(ctx, x, 178, 1, 64, PAL.counterEdge);
   rect(ctx, 0, 246, W, 24, PAL.bgShade);
+
+  // The wall banner: one line, the honest answer to "what is the kitchen
+  // doing right now", verbatim from the gate. A kitchen that never explains
+  // itself is just a screensaver.
+  const whyColor = st.state === 'ACTIVE_INFER' ? PAL.red
+    : st.state === 'ACTIVE_USER' ? PAL.amber
+    : st.state === 'IDLE' ? PAL.green : PAL.dim;
+  rect(ctx, 160, 74, 316, 14, PAL.ink);
+  text(ctx, (st.banner || st.state || 'offline').slice(0, 38), 164, 84, whyColor, 8);
 
   // Digest plate — the morning paper, under the pass, center-right.
   const d = st.digestWritten;
@@ -267,6 +276,14 @@ function drawPot(ctx, pot, b, t, events) {
 
   // waiting: just the generator tag, quiet
   if (s === 'waiting') text(ctx, '~', x + w - 8, y - 10, PAL.dim, 8);
+
+  // stage word above the pot: `plan`, `extract`, `synth`… so a glance reads
+  // *what* is cooking, not only that something is
+  if (pot.running) {
+    const kind = String(pot.running.kind || '').slice(0, 8);
+    rect(ctx, x - 4, y - 40, 52, 11, PAL.ink);
+    text(ctx, kind, x - 1, y - 32, PAL.steam, 8);
+  }
 
   // progress pips under the burner (chain stages done/seen)
   if (pot.progress) {
