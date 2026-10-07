@@ -13,7 +13,9 @@ import json
 import sqlite3
 from pathlib import Path
 
-from cooker import db
+import pytest
+
+from cooker import db, safety
 from cooker import eval as ev
 from cooker.config import Config
 
@@ -438,3 +440,37 @@ def test_judge_window_survives_a_lengthy_order(tmp_path: Path) -> None:
     draft_text = draft.read_text(encoding="utf-8")
     excerpt, _ceil = dt._excerpt_budget(topic[:118] + "…", [])
     assert 0 < excerpt <= len(draft_text) + 100
+
+
+def test_project_homes_are_minted_fresh_and_never_reused(tmp_path: Path) -> None:
+    """§21 amendment: delegations build in ~/dev/hobby homes, not in the
+    cooker's freezer — and a home that already exists is refused, because
+    'write only inside this directory' is only a promise if the directory
+    was empty to begin with."""
+    from cooker import runner as rm
+    c = cfg(tmp_path, deep_dive={"projects_root": str(tmp_path / "hobby")})
+    conn = conn_fresh()
+
+    def mk(task_topic: str) -> db.Task:
+        t = db.create_task(conn, chain_id=db.new_id(), kind="delegate",
+                           generator="deep-dive", title=task_topic[:60],
+                           payload={"topic": task_topic})
+        return db.Task.from_row(
+            conn.execute("SELECT * FROM tasks WHERE id=?", (t.id,)).fetchone())
+
+    home = rm.project_home(c, mk("Meal Planner: weekend menus"))
+    assert str(home).startswith(str((tmp_path / "hobby").resolve()))
+    assert home.name.startswith("meal-planner-weekend-menus-")
+    assert home.is_dir() and not any(home.iterdir())
+    # the same task minted twice is refused — a retry that survives the
+    # first attempt's ruins must not reroll over what the first attempt
+    # wrote; collision says so at mint time, before anything is written
+    same = mk("Meal Planner: weekend menus")
+    first = rm.project_home(c, same)
+    with pytest.raises(safety.PathRefused):
+        rm.project_home(c, same)
+    assert first.is_dir()
+    # a nasty topic cannot escape the root: every path shape is slugified
+    home2 = rm.project_home(c, mk("../../etc/passwd sudo rm -rf /"))
+    assert str(home2).startswith(str((tmp_path / "hobby").resolve()))
+    assert home2.name.startswith("etc-passwd-sudo-rm-rf-")

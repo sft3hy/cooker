@@ -292,6 +292,14 @@ opencode:
   # deny beats auto_permission: research never legitimately needs these.
   # deny_patterns: []   # unset = the module's built-in list
 
+# Where deep-dive delegations live when they build. The agent gets a
+# freshly minted, guaranteed-empty directory here — its own project home,
+# never a folder inside the cooker's var/outputs (the first "make its own
+# thing" order built a git repo AND a 52 MB chezmoi sandbox in the freezer;
+# that is why this knob exists and why mint refuses-if-exists).
+deep_dive:
+  projects_root: ~/dev/hobby
+
 # Sam orders work at the counter (the Kitchen tab). Pending orders are capped
 # so a burst of typing cannot fill the queue: 429 is honest, a silent drop is
 # not.

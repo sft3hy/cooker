@@ -27,6 +27,8 @@ What is non-negotiable, whatever runs through here:
 from __future__ import annotations
 
 import asyncio
+import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, replace
@@ -56,6 +58,30 @@ FREE_KINDS = frozenset({"search", "fetch", "publish", "collect", "scan",
                         "consolidate"})
 
 
+def project_home(cfg: Config, task: db.Task) -> Path:
+    """Mint a project home in the configured projects root (~/dev/hobby).
+
+    Fail-closed rules, in order: the slug must survive sanitising into a
+    non-empty name; the path must resolve inside the root (no topic
+    shaped like `../../` ever gets that far); and if the directory already
+    exists we refuse — a delegated agent with write access pointed at a
+    folder that already has an owner is how somebody's real project gets
+    lunch-rerolled. The task-id tail keeps names unique without making
+    them ugly; the suffix exists so collisions say so HERE, at mint time,
+    not mid-run over somebody's files."""
+    root = Path(str(cfg.get("deep_dive.projects_root", "~/dev/hobby"))).expanduser()
+    slug = re.sub(r"[^a-z0-9]+", "-", str(task.payload.get("topic")
+                                               or task.title).lower()).strip("-")
+    slug = slug[:40].strip("-") or "delegation"
+    home = (root / f"{slug}-{str(task.id)[-6:]}").resolve()
+    if not str(home).startswith(str(root.resolve()) + os.sep):
+        raise safety.PathRefused(f"project home escapes projects root: {home}")
+    if home.exists():
+        raise safety.PathRefused(f"project home already exists: {home}")
+    home.mkdir(parents=True)
+    return home
+
+
 def short_title(topic: str, limit: int = 90) -> str:
     """A readable heading for a document whose subject may be an essay.
 
@@ -80,13 +106,17 @@ proceeding.
 
 Subject of the deep-dive: {topic}
 
-Work only inside the current working directory. Use web search if a provider \
-is configured; otherwise work from what you know and mark every gap honestly \
-as "unverified". Never read .env files, keys, or anything outside this \
-directory.
+Your current working directory is YOUR OWN PROJECT HOME, freshly minted \
+in ~/dev/hobby for this task and empty until you fill it. You may build a \
+real project there: create files, `git init`, commit. You may never write \
+one byte outside it, never read .env files or keys, and if the order asks \
+for a deploy or a link on the homelab, you DESIGN it (write the deploy/ \
+files and the exact commands into the project) — the owner runs or approves \
+the hookup; you do not touch other services.
 
-Deliver, as your final assistant message (not as a file): a markdown brief of \
-500-900 words with exactly these sections:
+Deliver BOTH: the project on disk (git-committed), AND as your final \
+assistant message a markdown brief of 500-900 words with exactly these \
+sections:
 
 ## What it is
 ## Why it matters on a home server
@@ -367,8 +397,26 @@ class StageRunner:
             self.emit("runner.rejected", "delegate prompt withheld by safety",
                       {"task_id": task.id})
             return Outcome(task.id, db.REJECTED, reason="prompt withheld")
-        workdir = chains.day_dir(self.cfg) / "delegations" / task.id
-        await asyncio.to_thread(workdir.mkdir, parents=True, exist_ok=True)
+        # The delegation's workdir is a PROJECT HOME in ~/dev/hobby, not a
+        # scratch folder under var/outputs. Hands that build in the freezer
+        # freeze the kitchen: the first "make its own thing" deep-dive wrote
+        # a whole git repo (site/, deploy/, a 52 MB chezmoi sandbox) inside
+        # the cooker's outputs tree, where the code meant it to hold nothing
+        # but paper. It now gets a real home, minted fresh for the task:
+        # refuse-if-exists, so the agent can never be pointed at files that
+        # already belong to someone — including Sam's.
+        workdir = None
+        try:
+            workdir = project_home(self.cfg, task)
+        except safety.PathRefused as exc:
+            # refused at mint time is the kindest failure this stage can
+            # have: nothing was written anywhere, and the reason is on the
+            # row and in the log.
+            db.finish(self.conn, task.id, db.FAILED, error=str(exc),
+                      duration_ms=(time.perf_counter() - t0) * 1000)
+            self.emit("runner.refused", f"delegate mint refused: {exc}",
+                      {"task_id": task.id})
+            return Outcome(task.id, db.FAILED, reason=str(exc))
         try:
             res = await self.oc.run(title=f"deep-dive: {topic[:80]}",
                                      prompt=scan.text, workdir=workdir)
@@ -408,6 +456,7 @@ class StageRunner:
         # words the GPU reads are the brief, and nothing is lost, it is
         # just not the first thing a reader (or judge) meets.
         doc = (f"# {short_title(topic)}\n\n{res.text}\n\n---\n\n"
+               f"*project home: {workdir}*\n\n"
                f"*delegated to opencode session {res.session_id}; "
                f"{res.permissions_granted}/{res.permissions_seen} permissions "
                f"granted (policy), {res.forms_answered} form(s) answered; "
@@ -422,6 +471,7 @@ class StageRunner:
             return Outcome(task.id, db.FAILED, reason=str(exc))
         db.merge_payload(self.conn, task.id, {
             "draft_path": str(path), "session_id": res.session_id,
+            "project_home": str(workdir),
             "delegation": {"completed": res.completed,
                            "permissions_seen": res.permissions_seen,
                            "granted": res.permissions_granted,

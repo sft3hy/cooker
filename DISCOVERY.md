@@ -957,3 +957,35 @@ layer down: a lengthy order leaking into a channel it shouldn't, this time the
 audit channel. One crop (`short_title(topic, 120)`), one definition, both
 callers — request and record can no longer disagree about what was read. The
 first deep-dive published is real; the number beside it is now honest too.
+
+
+## §22 delegations get homes (2026-10-07, owner's order)
+
+Sam, after the first "make its own thing" deep-dive wrote its git repo —
+site/, deploy/, scripts/, and a 52 MB chezmoi sandbox — inside
+`var/outputs/delegations/<task-id>/`: *"fix cooker so that it doesn't do
+that any more, and instead makes its own directories and repos in
+~/dev/hobby/."* The brief said "work only inside the current working
+directory" and the agent obeyed perfectly; the address it was given was
+wrong. A freezer is not a workshop.
+
+The rule now, in code (`runner.project_home`):
+- every delegation mints a **fresh home** at
+  `~/dev/hobby/<slug>-<task-tail>` (`deep_dive.projects_root`, registered);
+- **refuse-if-exists**, fail-closed at mint time — "write only inside this
+  directory" is only a promise if the directory started empty; collisions
+  speak here, before anything is written, never mid-run over somebody's
+  files;
+- nasty topics slugify into the root; `..` has never punched out of a
+  properly sanitised slug, and the resolve-check is the belt on those pants;
+- the brief's own words changed with it: the workdir *is* a project home —
+  build, `git init`, commit; the homelab hookup (DNS, Traefik, dashboard
+  tiles) is **designed into deploy/ but executed by the owner** — the
+  commandment about other people's services does not bend for enthusiasm;
+- the cooker shelf (`var/outputs`) keeps what it always kept: paper — the
+  brief's text, stamped with the project's address in the payload and the
+  footer.
+
+The stranded meal-planner was moved out whole (its one commit intact) to
+`~/dev/hobby/meal-planner`, the 52 MB sandbox was swept, and the shelf is
+paper again.
