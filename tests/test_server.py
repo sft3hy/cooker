@@ -189,3 +189,69 @@ def test_collect_pots_uses_the_burners_in_order(client):
     pots = cl.get("/api/state").json()["pots"]
     assert [p["generator"] for p in pots] == list(server.BURNERS)
     assert [p["burner"] for p in pots] == list(range(6))
+
+
+def test_products_lists_the_shelves(client):
+    """The pantry tab's endpoint: every artifact, joined to its stage kind,
+    with byte sizes — a shelf that can say what is on it."""
+    cl, c, conn = client
+    task = db.create_task(conn, chain_id=db.new_id(), kind="synthesize",
+                          generator="research", title="synthesize: nas backups")
+    out = c.outputs_dir / "article.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("# jar of facts\n")
+    runner.register_artifact(conn, task, str(out), "h", status=db.PUBLISHED)
+    p = cl.get("/api/products").json()
+    assert p["counts"] == {"published": 1, "candidate": 0}
+    got = p["products"][0]
+    assert got["kind"] == "synthesize"
+    assert got["bytes"] == len("# jar of facts\n")
+    assert got["status"] == db.PUBLISHED
+    # and the id it hands out round-trips straight back through the reader
+    assert cl.get(f"/api/artifacts/{got['id']}").text.startswith("# jar")
+
+
+def test_stats_books_the_day(client):
+    cl, _c, conn = client
+    now = time.time()
+    task = db.create_task(conn, chain_id=db.new_id(), kind="synthesize",
+                          generator="research", title="synthesize: chunked prefill")
+    conn.execute(
+        "UPDATE tasks SET status='SUCCEEDED', started_at=?, finished_at=?,"
+        " duration_ms=5000, input_tokens=300, output_tokens=1200,"
+        " ttft_ms=95, preemptions=1 WHERE id=?", (now - 5, now, task.id))
+    conn.commit()
+    s = cl.get("/api/stats").json()
+    day = s["days"][-1]
+    assert day["stages"] == 1
+    assert day["output_tokens"] == 1200 and day["input_tokens"] == 300
+    assert day["gpu_seconds"] == 5.0 and day["preemptions"] == 1
+    gen = s["generators"][0]
+    assert gen["generator"] == "research" and gen["stages"] == 1
+
+
+def test_stats_published_counts_from_artifacts_not_the_cache(client):
+    """The books are honest even when the rollup cache missed the publish."""
+    cl, c, conn = client
+    now = time.time()
+    task = db.create_task(conn, chain_id=db.new_id(), kind="synthesize",
+                          generator="brainstorm", title="brainstorm: ideas")
+    out = c.outputs_dir / "ideas.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("ideas\n")
+    runner.register_artifact(conn, task, str(out), "h", status=db.PUBLISHED)
+    conn.execute("UPDATE tasks SET started_at=?, finished_at=?"
+                 " WHERE id=?", (now - 2, now, task.id))
+    conn.commit()  # no daily_stats rollup written at all
+    day = cl.get("/api/stats").json()["days"][-1]
+    assert day["published"] == 1, "published is truth, not cache"
+
+
+def test_digest_endpoint(client):
+    cl, c, _conn = client
+    assert cl.get("/api/digest").status_code == 404
+    assert cl.get("/api/digest?date=nope").status_code == 400
+    p = digest.digest_path(c, date.today())
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("# today's menu\n")
+    assert cl.get("/api/digest").text.startswith("# today's menu")

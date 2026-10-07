@@ -45,6 +45,15 @@ OFL Press Start 2P, SFX default off). Built into `web/dist/` (gitignored; rebuil
 `cd web && npm ci && npm run build` — node 26 is installed). It is served **right now**
 at `https://cooker.home.arpa` by the launchd-managed LIVE daemon.
 
+**Rooms (tabs, 2026-10-07):** KITCHEN (the stove: canvas, gate badge, drawer, ticker),
+PANTRY (every artifact the kitchen produced — `GET /api/products`, read one with the
+existing `GET /api/artifacts/{ref}`, today's digest via `GET /api/digest`), STATS
+(`GET /api/stats`: per-day tokens/GPU-seconds/serves, per-generator spend, and the
+live GPU picture straight from the gate), GUIDE (plain-language, no-code explanation —
+what the banners mean, the one rule, how the ledger judges). Keys 1–4 switch rooms;
+Esc closes the reader. The tab split was Sam's ask ("declutter, a stats dashboard,
+an outputs tab, kitchen theme"); the renderer in `kitchen.js` was not touched.
+
 **What's left?** M9 (six of eight generators are stubs) and M10 (`IMPLEMENTATION.md`).
 The 4s claim gate is no longer the blocker it was — **as of 11:24:09 today the gate
 opens and the daemon cooks with the monitors still hammering** (§20: the server's
@@ -66,6 +75,7 @@ scored unattended. Detail and ordering in §5.
 | M5 gate, dedup, feedback, digest | done | `bench10_digest_live.py` Test 3 PASS — evaluated live, digest rendered from the rows' own numbers |
 | M6 CLI surface | done | `status add pause resume list show rate digest doctor` |
 | **M7 kitchen UI** | **done** | `d6fe352` + `e3913fc` (font was preloaded but never *declared*; fractional-scale smear). 228 tests, 10 in `tests/test_server.py`; verified through TLS: `/` `/api/state` `/api/events?max_frames=1` fonts all 200 |
+| **UI rooms (§ §20b same day)** | **done** | tabs KITCHEN/PANTRY/STATS/GUIDE + `/api/products` `/api/stats` `/api/digest`; 257 tests (4 new server tests, incl. *published is truth, not cache*). One live trap caught at build time: a component prop named `state` makes Svelte 5 fall out of runes mode silently and the drawer stops being reactive — renamed to `snap`; `svelte/compiler` warnings are now the build gate, and they are zero. |
 | **M8 daemon + registration** | **done today** | launchd `com.homelab.cooker` KeepAlive **running** (`launchctl print` state=running, `serve --live`); Pi-hole A record live; Traefik router+service issued and verified with a homeca cert; `~/HOMELAB-SERVICE-MAP.md` has the routing row, `:8256` port row, Service Entry, dependency edges, Tier-2 listing and dated Changelog line. `doctor` launchd warn → pass |
 | M9 remaining generators | not started | `chains.advance` emits `chain.stub` for `deep-dive project-review homelab-audit brainstorm creation`; the orphan `brainstorm/generate` stage **ran for real at 11:24 and plated** (§20) — the queue drain now works, only the stub generators themselves remain |
 | M10 IMPLEMENTATION.md | not started | definition of done, written at the end |

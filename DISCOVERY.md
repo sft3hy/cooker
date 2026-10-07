@@ -786,3 +786,13 @@ to it. Nothing else.**
   regression test the old test-suite dodged by deleting the meta instead of
   resuming. Landmine #9, second sentence: *an empty meta row is not a pause
   order.*
+
+### §20b coda — the first judged plate (12:48:01)
+
+Score **3.6 ≥ 3.5**, published by the *living* daemon: `what a polite background job
+should do when it detects a human typing` — the machine writing about the very rule
+its owner had just amended, and passing the judge on its own words. Two older
+published rows carry NULL scores (§ pre-gate legacy); this one carries the stamp.
+The same afternoon's books: 159 research stages, 75,430 output tokens, 567 GPU
+seconds — then `topics.exhausted`: topics.md holds 16 subjects and the well ran
+dry in one working day. Production is now inventory-limited, not gate-limited.

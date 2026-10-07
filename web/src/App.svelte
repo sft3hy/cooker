@@ -1,28 +1,45 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
-  import { render, hitTestPot, W, H } from './lib/kitchen.js';
-  import { sfxFor, bubble, isMuted, setMuted, unlock } from './lib/sfx.js';
+  import { sfxFor, isMuted, setMuted, unlock } from './lib/sfx.js';
+  import Kitchen from './lib/Kitchen.svelte';
+  import Pantry from './lib/Pantry.svelte';
+  import Stats from './lib/Stats.svelte';
+  import Guide from './lib/Guide.svelte';
 
-  let canvas, wrap;
-  let scale = $state(2);
+  let tab = $state(localStorage.getItem('cooker.tab') || 'kitchen');
   let state = $state(null);
   let log = $state([]);            // recent events for the ticker + drawer
-  let drawer = $state(null);       // generator name | null
-  let artifact = $state(null);     // {id,title,text} | null
+  let stats = $state(null);       // the cook's books, for the STATS tab
+  let refreshKey = $state(0);     // bumps make Pantry re-shelve on events
   let muted = $state(isMuted());
   let sseNote = $state('connecting');
   let lastEventId = 0;
 
   let es = null;
   let pollTimer = null;
-  let bubbleTimer = null;
-  let raf = 0;
+  let statsTimer = null;
   // serveFlash: real events (published / digest) light the celebration for
   // 2.8s. It is driven off the event stream, never off a timer of its own —
   // a kitchen that congratulates itself on a schedule is a lie with confetti.
   let serveFlash = $state({ until: 0, kind: '' });
+  // the shared reader: one overlay, opened from the kitchen drawer or the
+  // pantry jars; text is fetched fresh every time (a stale read of a file
+  // the judge already scored would be the UI equivalent of a warm reheated
+  // plate pretending it was just cooked).
+  let artifact = $state(null);     // {id,title,status,score,text} | null
 
-  const HEAT = { filling: 1, simmer: 1, boiling: 1 };
+  const TABS = [
+    ['kitchen', 'KITCHEN'],
+    ['pantry', 'PANTRY'],
+    ['stats', 'STATS'],
+    ['guide', 'GUIDE'],
+  ];
+
+  function setTab(t) {
+    tab = t;
+    localStorage.setItem('cooker.tab', t);
+    // the stats $effect re-books whenever the tab opens — no double fetch
+  }
 
   async function refreshState() {
     try {
@@ -35,6 +52,43 @@
     }
   }
 
+  async function refreshStats() {
+    try {
+      const r = await fetch('./api/stats');
+      if (!r.ok) throw new Error(`stats ${r.status}`);
+      stats = await r.json();
+    } catch { /* keep the last honest books */ }
+  }
+
+  async function openArtifact(ref, meta) {
+    try {
+      const r = await fetch(`./api/artifacts/${encodeURIComponent(ref)}`);
+      const text = await r.text();
+      artifact = {
+        id: ref,
+        title: meta?.title || ref,
+        status: r.headers.get('X-Artifact-Status') || (r.ok ? '?' : 'gone'),
+        score: meta?.score ?? null,
+        text,
+      };
+    } catch {
+      artifact = { id: ref, title: ref, status: '?', score: null, text: '(cannot be read)' };
+    }
+  }
+
+  async function openDigest() {
+    try {
+      const r = await fetch('./api/digest');
+      const text = await r.text();
+      artifact = {
+        id: 'digest', title: r.ok ? "today's menu" : 'the menu',
+        status: r.ok ? 'DIGEST' : 'not printed', score: null, text,
+      };
+    } catch {
+      artifact = { id: 'digest', title: "today's menu", status: '?', score: null, text: '(cannot be read)' };
+    }
+  }
+
   function onEvent(ev) {
     let d = {};
     try { d = JSON.parse(ev.data); } catch { return; }
@@ -43,7 +97,11 @@
     if (d.type === 'runner.stage' || d.type === 'task.queued') refreshState();
     if (d.type === 'runner.published' || d.type === 'chain.complete'
         || d.type === 'runner.rejected' || d.type === 'digest.written'
-        || d.type === 'llm.abort' || d.type === 'runner.cancelled') refreshState();
+        || d.type === 'llm.abort' || d.type === 'runner.cancelled') {
+      refreshState();
+      refreshStats();
+      refreshKey++;
+    }
     if (d.type === 'runner.published' || d.type === 'chain.complete') {
       serveFlash = { until: Date.now() + 2800, kind: 'plate' };
     } else if (d.type === 'digest.written') {
@@ -69,142 +127,39 @@
     for (const t of types) es.addEventListener(t, onEvent);
   }
 
-  function computeScale() {
-    if (!wrap) return;
-    const availW = wrap.clientWidth - 8;
-    const availH = Math.max(140, window.innerHeight * 0.46);
-    const s = Math.max(1, Math.min(4, Math.floor(Math.min(availW / W, availH / H))));
-    scale = s;
-  }
-
-  function potScene() {
-    // The canvas scene: map the API payload to what the renderer draws.
-    if (!state) return { pots: [], state: 'OFFLINE', busy: false };
-    const g = state.gate || {};
-    const busy = g.stale ? false : g.state !== 'IDLE';
-    let banner;
-    if (g.stale) {
-      banner = 'daemon detached — last known state';
-    } else if (g.state === 'ACTIVE_INFER') {
-      banner = 'paused — someone is generating';
-    } else if (g.state === 'ACTIVE_USER') {
-      // since §20b only blindness lands here — typing does not. say so.
-      banner = (g.reason || '').includes('blind')
-        ? 'blind — cannot see the GPU'
-        : 'waiting — presence blocks (legacy mode)';
-    } else if ((state.workers?.slots || []).length) {
-      banner = `cooking — ${state.workers.slots.length} stage(s) on`;
-    } else if (g.ready && !g.ramped) {
-      banner = `one pot — ${(g.ramp_note || 'ramping').slice(0, 24)}`;
-    } else if (g.ready) {
-      banner = 'ready — filling the queue';
-    } else {
-      banner = `quiet ${(g.quiet_s ?? 0).toFixed(0)}s of ${(g.ready_in_s || 4).toFixed(0)}`;
-    }
-    return {
-      pots: state.pots,
-      state: g.stale ? 'OFFLINE?' : g.state,
-      busy: busy || g.state === 'ACTIVE_INFER',
-      ready: !!(g.ready && !busy && !g.stale),
-      banner,
-      note: (g.reason || '').slice(0, 46),
-      digestWritten: state.digest?.written,
-      platedToday: state.today?.published ?? 0,
-      dryRun: state.workers?.dry_run,
-      onAir: !g.stale && !!((state.workers?.slots || []).length || running),
-      tokensToday: (state.today?.input_tokens ?? 0) + (state.today?.output_tokens ?? 0),
-      flashUntil: serveFlash.until,
-      flashKind: serveFlash.kind,
-    };
-  }
-
-  function frame() {
-    if (canvas) {
-      const ctx = canvas.getContext('2d');
-      ctx.imageSmoothingEnabled = false;
-      render(ctx, potScene(), log);
-    }
-    raf = requestAnimationFrame(frame);
-  }
-
-  function onClick(e) {
-    unlock();
-    const rect = canvas.getBoundingClientRect();
-    // logical coords from the *rendered* rect, not the assumed scale: if a
-    // font load or zoom nudged the layout between frames, the rect is still
-    // the truth and a stale `scale` is not.
-    const mx = (e.clientX - rect.left) * (W / rect.width);
-    const my = (e.clientY - rect.top) * (H / rect.height);
-    const gen = hitTestPot(mx, my);
-    if (gen) {
-      drawer = gen;
-      artifact = null;
-    } else {
-      drawer = null;
-    }
-  }
-
   function toggleMute() {
     muted = !muted;
     setMuted(muted);
     if (!muted) { unlock(); sfxFor('digest.written'); }
   }
 
-  async function openArtifact(id) {
-    const r = await fetch(`./api/artifacts/${encodeURIComponent(id)}`);
-    const text = await r.text();
-    artifact = { id, status: r.headers.get('X-Artifact-Status') || '?', text };
+  function onKey(e) {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'Escape') { artifact = null; return; }
+    const hit = TABS.find(([key], i) => String(i + 1) === e.key);
+    if (hit) setTab(hit[0]);
   }
 
+  $effect(() => {
+    if (tab !== 'stats') return;
+    refreshStats();
+    statsTimer = setInterval(refreshStats, 15000);
+    return () => clearInterval(statsTimer);
+  });
+
   onMount(async () => {
-    computeScale();
-    window.addEventListener('resize', computeScale);
-    // fonts change metrics and the fit is arithmetic on them; redraw is every
-    // frame anyway, but re-fitting after the pixel font lands keeps the
-    // integer scale honest.
-    if (document.fonts?.ready) document.fonts.ready.then(computeScale);
+    window.addEventListener('keydown', onKey);
     await refreshState();
     connect();
     pollTimer = setInterval(refreshState, 4000);
-    bubbleTimer = setInterval(() => {
-      if (state?.pots?.some(p => HEAT[p.state])) bubble();
-    }, 700);
-    raf = requestAnimationFrame(frame);
   });
 
   onDestroy(() => {
     clearInterval(pollTimer);
-    clearInterval(bubbleTimer);
-    cancelAnimationFrame(raf);
+    clearInterval(statsTimer);
     es?.close();
-    window.removeEventListener('resize', computeScale);
+    window.removeEventListener('keydown', onKey);
   });
-
-  // drawer helpers
-  function drawerData() {
-    if (!drawer || !state) return null;
-    const pot = state.pots.find(p => p.generator === drawer);
-    const genEvents = log.filter(e => e.generator === drawer).slice(-14).reverse();
-    const arts = (state.artifacts || []).filter(a => a.generator === drawer);
-    return { pot, genEvents, arts };
-  }
-
-  function fmtAge(s) {
-    if (s == null) return '';
-    if (s < 60) return `${Math.round(s)}s`;
-    if (s < 3600) return `${Math.round(s / 60)}m`;
-    return `${(s / 3600).toFixed(1)}h`;
-  }
-
-  let gateBar = $derived.by(() => {
-    const g = state?.gate || {};
-    if (!g.ready && g.ready_in_s > 0) return { label: `ready in ${Math.ceil(g.ready_in_s)}s`, pct: 0 };
-    if (g.ramp_note) return { label: g.ramp_note.slice(0, 40), pct: 0.5 };
-    if (g.quiet_s != null) return { label: `quiet ${Math.round(g.quiet_s)}s`, pct: 1 };
-    return { label: g.stale ? 'last known' : '', pct: 0 };
-  });
-
-  let running = $derived((state?.workers?.slots || []).length || (state?.running || []).length);
 </script>
 
 <main>
@@ -216,93 +171,21 @@
     </button>
   </header>
 
-  <section class="scene" bind:this={wrap}>
-    <div class="tv">
-      <canvas
-        bind:this={canvas}
-        width={W}
-        height={H}
-        style="width:{W * scale}px; height:{H * scale}px;"
-        onclick={onClick}
-        aria-label="pixel kitchen: six burners, one per generator — click a pot to inspect it"
-      ></canvas>
-      <!-- CRT scanlines + vignette: pure decoration, pointer-events none,
-           and it lives on TOP of the canvas so it never touches the logical
-           pixels — the integers underneath stay integers. -->
-      <div class="scan" aria-hidden="true"></div>
-    </div>
-  </section>
-
-  <section class="hud">
-    <div class="badge">
-      {#if state?.gate}
-        <b>{state.gate.state}</b>
-        <span class="why">{(state.gate.reason || '').slice(0, 60)}</span>
-        <span class="bar"><i style="width:{gateBar.pct * 100}%"></i></span>
-        <span class="gate">{gateBar.label}</span>
-      {:else}
-        <span class="why">no state</span>
-      {/if}
-    </div>
-    <dl>
-      <div><dt>stages</dt><dd>{state?.today?.stages ?? '—'}</dd></div>
-      <div><dt>gpu</dt><dd>{state?.today?.gpu_seconds ?? '—'}s</dd></div>
-      <div><dt>tokens</dt><dd>{((state?.today?.input_tokens ?? 0) + (state?.today?.output_tokens ?? 0)).toLocaleString()}</dd></div>
-      <div><dt>p95 ttft</dt><dd>{state?.workers?.p95_ttft_s ?? '—'}</dd></div>
-      <div><dt>preempt</dt><dd>{state?.today?.preemptions ?? '—'}</dd></div>
-      <div><dt>plated</dt><dd>{state?.today?.published ?? 0}</dd></div>
-      <div><dt>running</dt><dd>{running}</dd></div>
-    </dl>
-  </section>
-
-  {#if drawer}
-    {@const d = drawerData()}
-    <section class="drawer">
-      <div class="drawer-head">
-        <h2>{drawer}</h2>
-        <button onclick={() => { drawer = null; artifact = null; }}>close</button>
-      </div>
-      {#if d?.pot}
-        <p class="potstate">
-          {d.pot.state}
-          {#if d.pot.running}
-            · {d.pot.running.kind} · {d.pot.running.elapsed_s}s
-          {/if}
-          {#if d.pot.queued}· {d.pot.queued} queued{/if}
-          {#if d.pot.backoff_s}· backoff {Math.ceil(d.pot.backoff_s)}s{/if}
-        </p>
-        {#if artifact}
-          <pre class="md">{artifact.text}</pre>
-        {:else}
-          {#if d.arts.length}
-            <h3>plates</h3>
-            <ul class="arts">
-              {#each d.arts as a}
-                <li>
-                  <button onclick={() => openArtifact(a.id)}>{a.title}</button>
-                  <span class="score">{a.score ?? '—'} <em>{a.status.toLowerCase()}</em> {fmtAge(a.age_s)}</span>
-                </li>
-              {/each}
-            </ul>
-          {/if}
-          <h3>log</h3>
-          <ul class="log">
-            {#each d.genEvents as e}
-              <li class={e.severity}><code>{e.type}</code> {e.message || ''}</li>
-            {:else}
-              <li class="dim">nothing yet</li>
-            {/each}
-          </ul>
-        {/if}
-      {/if}
-    </section>
-  {/if}
-
-  <section class="ticker">
-    {#each log.slice(-8).reverse() as e}
-      <p class={e.severity}><code>{e.type}</code> {(e.message || '').slice(0, 110)}</p>
+  <nav class="tabs" aria-label="rooms">
+    {#each TABS as [key, label] (key)}
+      <button class="tab" class:on={tab === key} onclick={() => setTab(key)}>{label}</button>
     {/each}
-  </section>
+  </nav>
+
+  {#if tab === 'kitchen'}
+    <Kitchen snap={state} {log} {serveFlash} {openArtifact} />
+  {:else if tab === 'pantry'}
+    <Pantry refreshKey={refreshKey} {openArtifact} {openDigest} />
+  {:else if tab === 'stats'}
+    <Stats snap={state} {stats} />
+  {:else}
+    <Guide />
+  {/if}
 
   <footer>
     {#if state?.topics?.count}
@@ -311,6 +194,26 @@
     <span class="disk">{state ? (state.disk.bytes / 1024 / 1024).toFixed(1) : '—'} MB</span>
   </footer>
 </main>
+
+{#if artifact}
+  <div class="overlay" role="dialog" aria-modal="true" aria-label="the dish">
+    <section class="plate">
+      <div class="plate-head">
+        <h2>{artifact.title}</h2>
+        <span class="stamp" class:gold={artifact.status === 'PUBLISHED'}>
+          {artifact.status}{#if artifact.score != null} · {artifact.score}{/if}
+        </span>
+        <div class="plate-actions">
+          <button onclick={() => {
+            navigator.clipboard?.writeText(artifact.text);
+          }}>copy</button>
+          <button onclick={() => { artifact = null; }}>close (esc)</button>
+        </div>
+      </div>
+      <pre class="md">{artifact.text}</pre>
+    </section>
+  </div>
+{/if}
 
 <style>
   :global(:root) {
@@ -337,6 +240,13 @@
     background: var(--bg);
     color: var(--ink);
     font: 13px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  :global(.md) {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font: 12.5px/1.65 ui-monospace, "SF Mono", Menlo, monospace;
+    color: var(--cream);
+    margin: 0;
   }
   main {
     max-width: 1080px;
@@ -367,100 +277,82 @@
     padding: 6px 8px;
     cursor: pointer;
   }
-  .scene { text-align: center; margin: 6px 0 10px; }
-  .tv { position: relative; display: inline-block; line-height: 0; }
-  .scan {
-    position: absolute;
-    inset: 0;
-    pointer-events: none;
-    background:
-      radial-gradient(ellipse at center, transparent 62%, rgba(8, 4, 14, 0.38) 100%),
-      repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.20) 0 1px, transparent 1px 3px);
-    mix-blend-mode: multiply;
-  }
   .star {
     color: var(--amber);
     animation: blink 1.1s steps(2, jump-none) infinite;
   }
   @keyframes blink { 50% { opacity: 0.15; } }
-  canvas {
-    image-rendering: pixelated;
-    image-rendering: crisp-edges;
-    border: 4px solid #322640;
-    background: #241c2e;
-    cursor: pointer;
-    /* no max-width here on purpose: `width:{W*scale}px` with an integer
-       scale already fits — computeScale floors to the container. A max-width
-       that re-shrinks the canvas turns the integer scale back into a
-       fractional one, and fractional is exactly the smear we declared war
-       on. */
-  }
-  .hud { margin: 4px 0 10px; }
-  .badge {
+  .tabs {
     display: flex;
-    align-items: center;
-    gap: 10px;
-    background: var(--panel);
-    border: 2px solid #322640;
-    padding: 6px 10px;
+    gap: 4px;
+    border-bottom: 2px solid #322640;
+    margin: 2px 0 4px;
     flex-wrap: wrap;
   }
-  .badge b { font-family: "Press Start 2P", monospace; font-size: 10px; color: var(--amber); }
-  .badge .why { color: var(--dim); font-size: 11px; }
-  .badge .gate { color: var(--cyan); font-size: 11px; }
-  .bar { flex: 1 1 80px; height: 6px; background: #16101e; min-width: 60px; }
-  .bar i { display: block; height: 100%; background: var(--green); }
-  dl {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
-    gap: 4px;
-    margin: 6px 0 0;
+  .tab {
+    font-family: "Press Start 2P", monospace;
+    font-size: 9px;
+    background: transparent;
+    color: var(--dim);
+    border: 2px solid transparent;
+    border-bottom: none;
+    padding: 8px 12px 7px;
+    cursor: pointer;
+    letter-spacing: 1px;
   }
-  dl > div {
-    background: var(--panel);
-    border: 2px solid #322640;
-    padding: 4px 8px;
-  }
-  dt { font-size: 9px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
-  dd { margin: 0; font-family: "Press Start 2P", monospace; font-size: 11px; color: var(--cream); }
-  .drawer {
-    background: var(--panel);
-    border: 2px solid var(--amber);
-    padding: 8px 12px;
-    margin: 8px 0;
-  }
-  .drawer-head { display: flex; justify-content: space-between; align-items: center; }
-  h2 { font-family: "Press Start 2P", monospace; font-size: 11px; color: var(--amber); margin: 4px 0; }
-  h3 { font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin: 10px 0 4px; }
-  .potstate { color: var(--cyan); font-size: 12px; }
-  .drawer button {
-    background: none; border: 1px solid var(--dim); color: var(--cream);
-    font: inherit; cursor: pointer; padding: 2px 6px;
-  }
-  .arts { list-style: none; padding: 0; margin: 0; }
-  .arts li { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
-  .arts button { border: none; border-bottom: 1px dotted var(--amber); text-align: left; flex: 1; padding: 0; }
-  .score { color: var(--dim); font-size: 11px; white-space: nowrap; }
-  .log, .ticker { list-style: none; padding: 0; margin: 0; font-size: 11px; }
-  .log li, .ticker p { padding: 1px 0; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .log code, .ticker code { color: var(--cyan); font-size: 10px; }
-  .warn { color: var(--amber); }
-  .error { color: var(--red); }
-  .dim { color: #55506a; }
-  .ticker {
-    border-top: 2px solid #322640;
-    margin-top: 14px;
-    padding-top: 6px;
+  .tab:hover { color: var(--cream); }
+  .tab.on {
+    color: var(--bg);
+    background: var(--amber);
+    border-color: var(--amber);
+    /* the lit tab is the door that is open — amber like the OPEN sign,
+       and it physically sits on the seam so the room below belongs to it */
+    box-shadow: 0 2px 0 var(--amber);
   }
   footer {
     display: flex;
     justify-content: space-between;
     color: var(--dim);
     font-size: 11px;
-    margin-top: 10px;
+    margin-top: 18px;
   }
+  .overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(10, 6, 16, 0.78);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 18px;
+    z-index: 40;
+  }
+  .plate {
+    width: min(860px, 96vw);
+    max-height: 88vh;
+    overflow: auto;
+    background: var(--panel);
+    border: 3px solid var(--amber);
+    padding: 12px 16px 18px;
+  }
+  .plate-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .plate-head h2 {
+    font-family: "Press Start 2P", monospace;
+    font-size: 10px; color: var(--cream); margin: 0; flex: 1; line-height: 1.5;
+  }
+  .stamp {
+    font-family: "Press Start 2P", monospace; font-size: 8px;
+    color: var(--dim); border: 1px solid var(--dim); padding: 4px 6px; white-space: nowrap;
+  }
+  .stamp.gold { color: #ffd94a; border-color: #ffd94a; }
+  .plate-actions { display: flex; gap: 6px; }
+  .plate-actions button {
+    background: none; border: 1px solid var(--dim); color: var(--cream);
+    font: inherit; font-size: 11px; cursor: pointer; padding: 3px 8px;
+  }
+  .plate-actions button:hover { border-color: var(--amber); color: var(--amber); }
+  .plate pre { margin-top: 10px; }
   @media (max-width: 520px) {
-    dl { grid-template-columns: repeat(3, 1fr); }
     h1 { font-size: 12px; }
+    .tab { font-size: 8px; padding: 7px 8px 6px; }
   }
 </style>

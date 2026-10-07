@@ -30,7 +30,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -450,6 +450,135 @@ def create_app(cfg: Config, kitchen: Any = None) -> FastAPI:
         finally:
             if own:
                 conn.close()
+
+    @app.get("/api/products")
+    async def api_products() -> JSONResponse:
+        """The pantry: every plate the kitchen has actually produced.
+
+        A projection of the artifacts table joined against the stage that made
+        it, newest first, file sizes stat'd in a thread so the SSE loop never
+        blocks on a disk. Titles keep their `kind: ` prefix from the store —
+        the pantry strips it for display and keeps `kind` as its own field,
+        because a shelf of jars all starting with the same word tells you
+        nothing about which one is the article.
+        """
+        conn, own = conn_for()
+        try:
+            rows = conn.execute(
+                "SELECT a.id, a.generator, a.title, a.status, a.score,"
+                " a.path, a.created_at, t.kind"
+                " FROM artifacts a LEFT JOIN tasks t ON t.id = a.task_id"
+                " ORDER BY a.created_at DESC LIMIT 300").fetchall()
+
+            def build() -> list[dict[str, Any]]:
+                out = []
+                for r in rows:
+                    try:
+                        size: int | None = Path(str(r["path"])).stat().st_size
+                    except OSError:
+                        size = None
+                    out.append({
+                        "id": eval_mod.short_id(str(r["id"])),
+                        "generator": r["generator"],
+                        "kind": r["kind"] or Path(str(r["path"])).stem,
+                        "title": str(r["title"]),
+                        "status": r["status"],
+                        "score": r["score"],
+                        "bytes": size,
+                        "day": time.strftime("%Y-%m-%d %H:%M",
+                                            time.localtime(float(r["created_at"]))),
+                    })
+                return out
+
+            products = await asyncio.to_thread(build)
+            counts = {"published": sum(1 for p in products
+                                        if p["status"] == db.PUBLISHED),
+                     "candidate": sum(1 for p in products
+                                      if p["status"] == db.CANDIDATE)}
+            return JSONResponse({"products": products, "counts": counts})
+        finally:
+            if own:
+                conn.close()
+
+    @app.get("/api/stats")
+    async def api_stats() -> JSONResponse:
+        """The cook's books: per-day cost and per-generator spend.
+
+        Days come from days that actually have stages — a chart with a bar of
+        zeros every day the daemon was off would be the kind of honest that
+        reads as a lie about the quiet. Published/rejected ride in from the
+        daily rollup when it has them."""
+        conn, own = conn_for()
+        try:
+            days = [str(r["d"]) for r in conn.execute(
+                "SELECT DISTINCT strftime('%Y-%m-%d',"
+                " COALESCE(started_at, finished_at), 'unixepoch','localtime') AS d"
+                " FROM tasks WHERE COALESCE(started_at, finished_at) IS NOT NULL"
+                " ORDER BY d DESC LIMIT 14").fetchall()]
+            series = []
+            for ds in reversed(days):
+                cost = digest_mod.day_cost(conn, date.fromisoformat(ds))
+                roll = conn.execute(
+                    "SELECT requests, rejected, ttft_sum_ms, ttft_count"
+                    " FROM daily_stats WHERE day = ?", (ds,)).fetchone()
+                # published counts straight from artifacts — that table is the
+                # truth of what was plated; the rollup is a cache of it.
+                pub = int(conn.execute(
+                    "SELECT COUNT(*) FROM artifacts WHERE status = ?"
+                    " AND date(created_at, 'unixepoch', 'localtime') = ?",
+                    (db.PUBLISHED, ds)).fetchone()[0])
+                series.append({
+                    "day": ds, **cost,
+                    "published": pub,
+                    "rejected": int(roll["rejected"]) if roll else 0,
+                    "ttft_avg_ms": (round(float(roll["ttft_sum_ms"])
+                                           / int(roll["ttft_count"]), 1)
+                                    if roll and roll["ttft_count"] else None),
+                })
+            gens = [
+                {"generator": str(g["generator"]), "stages": int(g["stages"]),
+                 "input_tokens": int(g["tin"]), "output_tokens": int(g["tout"]),
+                 "gpu_seconds": round(float(g["ms"]) / 1000.0, 1),
+                 "preemptions": int(g["pre"])}
+                for g in conn.execute(
+                    "SELECT generator, COUNT(*) AS stages,"
+                    " COALESCE(SUM(input_tokens),0) AS tin,"
+                    " COALESCE(SUM(output_tokens),0) AS tout,"
+                    " COALESCE(SUM(duration_ms),0) AS ms,"
+                    " COALESCE(SUM(preemptions),0) AS pre"
+                    " FROM tasks"
+                    " WHERE COALESCE(started_at, finished_at) IS NOT NULL"
+                    " GROUP BY generator ORDER BY tout DESC").fetchall()]
+            return JSONResponse({"days": series, "generators": gens})
+        finally:
+            if own:
+                conn.close()
+
+    @app.get("/api/digest")
+    async def api_digest(
+        date_str: str | None = Query(default=None, alias="date"),
+    ) -> PlainTextResponse:
+        """Today's menu — the digest markdown, by date, from our own writer."""
+        d = date.today()
+        if date_str:
+            try:
+                d = date.fromisoformat(date_str)
+            except ValueError:
+                return PlainTextResponse("date must be YYYY-MM-DD", status_code=400)
+        path = digest_mod.digest_path(cfg, d)
+
+        def read() -> tuple[str | None, int]:
+            root = cfg.outputs_dir.resolve()
+            p = path.resolve()
+            if not p.is_relative_to(root):
+                return "digest lives outside outputs_dir", 403
+            if not p.is_file():
+                return f"no digest for {d.isoformat()} yet", 404
+            return p.read_text("utf-8"), 200
+
+        text, code = await asyncio.to_thread(read)
+        return PlainTextResponse(text or "", status_code=code,
+                                 media_type="text/markdown; charset=utf-8")
 
     dist = Path(__file__).resolve().parents[2] / "web" / "dist"
     if dist.is_dir():
