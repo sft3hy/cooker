@@ -572,3 +572,39 @@ a monitor poll does not move it, an inference does, whatever the wire says. And
    or continuously during generation? If completion-only, ledger corroboration
    is blind mid-generation and the sustained-stream test must carry the load.
    Measure before coding.
+
+### §17 follow-up: the shape measurement (bench14) and why shape does not save the 4s gate
+
+Per-second shape of omlx's bytes while the agent was quiet, two 25–30s runs:
+
+    [0, 322, 6282, 0,0,0, 322, 6281, 0,0,0,0, 6602, 0,0,0,0, 6602, ...]
+    quiet gaps between events: [3, 0, 4, 4, 2, 0]
+
+The poll is one ~6.6 KB response that arrives split across one or two
+sample-seconds (TLS boundary), every ~5s. So:
+
+1. The plateau at 1,720 B/s was the ring smearing a burst, exactly as
+   suspected — the wire is NOT busy for 3.5s, it is quiet for 3s at a time.
+2. Shape separation cannot rescue the 4-second gate here, because the poll's
+   cadence itself is 5s: quiet gaps top out at 4.0s against `claim_quiet: 4.0`.
+   A rule of "ACTIVE_INFER requires >=2 consecutive sample-seconds" would still
+   trip on the poll's own header/body split (322B + 6.3KB), and demoting
+   <=2.5s bursts under a byte cap would also demote short *real* generations —
+   batch and curl-shaped interactive traffic included, which is exactly what
+   OVERVIEW Test 2 protects. Byte size does not separate poll from answer;
+   only the source does, and nettop cannot see the source's URL.
+3. The admin API can therefore not be polled by the detector without poisoning
+   the meter it is meant to corroborate — its own 6.6 KB burst is the same
+   shape the detector would be demoting. (§17's ledger idea survives only in a
+   form where the ledger comes from something quieter than omlx's admin API.)
+
+### What this decides, concretely (Sam's call, one line each)
+
+- **Fix at the source (recommended):** bump `edge-dashboard`'s omlx-stats fetch
+  from 5s to 30s (`setInterval(tick, 5000)` in its `server.js`; its docker
+  stats stay 5s — that traffic never touches :8000). Quiet gaps become ~28s,
+  the 4s gate opens several times a minute, a bounded stage fits inside every
+  gap, and nothing about the safety asymmetry changes.
+- If instead we ever demote short bursts cooker-side, that is a *relaxation* of
+  false-idle risk and needs an explicit yes; the default keeps bytes the trigger
+  and the asymmetry safety-first.
